@@ -1,0 +1,59 @@
+erDiagram
+    accounts {
+        uuid account_uuid PK
+        int account_id
+        varchar account_name
+        varchar account_email UK
+        text account_password
+        enum account_role
+        timestamp created_at
+        varchar created_by
+        timestamp updated_at
+        varchar updated_by
+    }
+
+    menu {
+        uuid menu_uuid PK
+        int menu_id
+        varchar category
+        varchar item_name
+        text item_description
+        decimal standard_price
+        decimal small_price
+        decimal large_price
+        timestamp created_at
+        varchar created_by
+        timestamp updated_at
+        varchar updated_by
+    }
+
+    orders {
+        uuid order_uuid PK
+        int order_id
+        int order_number
+        varchar table_name
+        varchar customer_name
+        varchar phone_number
+        enum payment_method
+        enum payment_status
+        varchar payment_transaction_id
+        decimal total_price
+        timestamp created_at
+        varchar created_by
+        timestamp updated_at
+        varchar updated_by
+    }
+
+    order_items {
+        uuid order_item_uuid PK
+        int order_item_id
+        uuid order_uuid FK
+        uuid menu_uuid FK
+        enum selected_size
+        int quantity
+        decimal unit_price
+        decimal line_total
+    }
+
+    orders ||--o{ order_items : contains
+    menu ||--o{ order_items : ordered_in
