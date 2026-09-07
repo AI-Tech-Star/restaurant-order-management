@@ -1,0 +1,108 @@
+name: Secure DevOps Continuous Deployment (prod)
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: prod-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =========================================================================
+  # PROD GATE: PR SOURCE VALIDATION (ONLY dev -> main ALLOWED)
+  # =========================================================================
+  validate-pr-source:
+    name: "PR Source Check: Only dev branch -> main"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce dev-only source for main PRs
+        run: |
+          if [ "${{ github.head_ref }}" != "dev" ]; then
+            echo "❌ PRs to 'main' are allowed ONLY from the 'dev' branch."
+            echo "   Pull request source branch: ${{ github.head_ref }}"
+            echo "   Rejected: no other branch or feature branch may target 'main'."
+            exit 1
+          fi
+          echo "✅ PR source branch is 'dev'. Proceeding to production approval gate."
+
+  # =========================================================================
+  # PROD STAGE 1: BUILD & PUSH (AFTER MERGE TO MAIN - AFTER APPROVAL)
+  # Approval: Settings > Environments > production > Required reviewers.
+  # =========================================================================
+  docker-build-push-prod:
+    name: "Stage 1: Prod Docker Hub Compilation & Push"
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Free Docker Hub Account
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.PROD_DOCKERHUB_USERNAME }}
+          password: ${{ secrets.PROD_DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Backend Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: ${{ secrets.PROD_DOCKERHUB_USERNAME }}/restaurant-api:latest
+
+      - name: Build and Push Frontend Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: ${{ secrets.PROD_DOCKERHUB_USERNAME }}/restaurant-web:latest
+
+  # =========================================================================
+  # PROD STAGE 2: EC2 DEPLOYMENT (AFTER MERGE TO MAIN - AFTER APPROVAL)
+  # =========================================================================
+  ec2-deployment-prod:
+    name: "Stage 2: Prod Remote Live EC2 Deployment"
+    needs: [docker-build-push-prod]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Execute Safe Remote SSH Deployment Script
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.PROD_EC2_SSH_KEY }}
+          script: |
+            echo "${{ secrets.PROD_DOCKERHUB_TOKEN }}" | sudo docker login -u "${{ secrets.PROD_DOCKERHUB_USERNAME }}" --password-stdin
+
+            # Backend container (port 8000)
+            sudo docker stop restaurant-api || true
+            sudo docker rm restaurant-api || true
+            sudo docker pull ${{ secrets.PROD_DOCKERHUB_USERNAME }}/restaurant-api:latest
+
+            sudo docker run -d \
+              --name restaurant-api \
+              -p 8000:8000 \
+              --restart unless-stopped \
+              ${{ secrets.PROD_DOCKERHUB_USERNAME }}/restaurant-api:latest
+
+            # Frontend container (port 80)
+            sudo docker stop restaurant-web || true
+            sudo docker rm restaurant-web || true
+            sudo docker pull ${{ secrets.PROD_DOCKERHUB_USERNAME }}/restaurant-web:latest
+
+            sudo docker run -d \
+              --name restaurant-web \
+              -p 80:80 \
+              --restart unless-stopped \
+              ${{ secrets.PROD_DOCKERHUB_USERNAME }}/restaurant-web:latest
+
+            sudo docker system prune -af
+            echo "🚀 PROD Backend (port 8000) and Frontend (port 80) deployed successfully on AWS EC2!"

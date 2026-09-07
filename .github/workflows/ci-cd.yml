@@ -1,4 +1,4 @@
-name: Secure DevOps CI/CD Pipeline
+name: Secure DevOps CI/CD Pipeline (dev)
 
 on:
   pull_request:
@@ -235,14 +235,15 @@ jobs:
 
   # =========================================================================
   # STAGE 6 & 7: SECURITY SCANNING WITH HUMAN APPROVAL & FALSE-POSITIVE FILTERS
-  # The 'production' environment gates this job behind a manual approval
-  # in GitHub (Settings > Environments > production > Required reviewers).
+  # The 'dev' environment gates this job behind a manual approval
+  # in GitHub (Settings > Environments > dev > Required reviewers).
+  # Approval is requested AFTER the security scans and BEFORE the docker build.
   # =========================================================================
   security-scans:
     name: "Stage 6 & 7: SAST and SCA Security Audits"
     needs: [secrets-code-dockerfile-scan]
     runs-on: ubuntu-latest
-    environment: production
+    environment: dev
     steps:
       - name: Checkout Code Repository
         uses: actions/checkout@v4
@@ -291,7 +292,7 @@ jobs:
   # STAGE 8: DOCKER BUILD & PUSH (SEPARATE STAGE - MERGE TO DEV ONLY)
   # =========================================================================
   docker-build-push:
-    name: "Stage 8: Docker Hub Compilation & Push"
+    name: "Stage 8: Docker Hub Compilation & Push (dev)"
     needs: [security-scans]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -302,8 +303,8 @@ jobs:
       - name: Log in to Free Docker Hub Account
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DEV_DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DEV_DOCKERHUB_TOKEN }}
 
       - name: Build and Push Backend Image
         uses: docker/build-push-action@v5
@@ -311,7 +312,7 @@ jobs:
           context: ./backend
           file: ./backend/Dockerfile
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/restaurant-api:latest
+          tags: ${{ secrets.DEV_DOCKERHUB_USERNAME }}/restaurant-api:dev
 
       - name: Build and Push Frontend Image
         uses: docker/build-push-action@v5
@@ -319,13 +320,13 @@ jobs:
           context: ./frontend
           file: ./frontend/Dockerfile
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/restaurant-web:latest
+          tags: ${{ secrets.DEV_DOCKERHUB_USERNAME }}/restaurant-web:dev
 
   # =========================================================================
   # STAGE 9: AWS EC2 DEPLOYMENT (SEPARATE STAGE - MERGE TO DEV ONLY)
   # =========================================================================
   ec2-deployment:
-    name: "Stage 9: Remote Live EC2 Deployment"
+    name: "Stage 9: Remote Live EC2 Deployment (dev)"
     needs: [docker-build-push]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -333,33 +334,33 @@ jobs:
       - name: Execute Safe Remote SSH Deployment Script
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.EC2_HOST }}
+          host: ${{ secrets.DEV_EC2_HOST }}
           username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
+          key: ${{ secrets.DEV_EC2_SSH_KEY }}
           script: |
-            echo "${{ secrets.DOCKERHUB_TOKEN }}" | sudo docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+            echo "${{ secrets.DEV_DOCKERHUB_TOKEN }}" | sudo docker login -u "${{ secrets.DEV_DOCKERHUB_USERNAME }}" --password-stdin
 
             # Backend container (port 8000)
             sudo docker stop restaurant-api || true
             sudo docker rm restaurant-api || true
-            sudo docker pull ${{ secrets.DOCKERHUB_USERNAME }}/restaurant-api:latest
+            sudo docker pull ${{ secrets.DEV_DOCKERHUB_USERNAME }}/restaurant-api:dev
 
             sudo docker run -d \
               --name restaurant-api \
               -p 8000:8000 \
               --restart unless-stopped \
-              ${{ secrets.DOCKERHUB_USERNAME }}/restaurant-api:latest
+              ${{ secrets.DEV_DOCKERHUB_USERNAME }}/restaurant-api:dev
 
             # Frontend container (port 80)
             sudo docker stop restaurant-web || true
             sudo docker rm restaurant-web || true
-            sudo docker pull ${{ secrets.DOCKERHUB_USERNAME }}/restaurant-web:latest
+            sudo docker pull ${{ secrets.DEV_DOCKERHUB_USERNAME }}/restaurant-web:dev
 
             sudo docker run -d \
               --name restaurant-web \
               -p 80:80 \
               --restart unless-stopped \
-              ${{ secrets.DOCKERHUB_USERNAME }}/restaurant-web:latest
+              ${{ secrets.DEV_DOCKERHUB_USERNAME }}/restaurant-web:dev
 
             sudo docker system prune -af
-            echo "🚀 Backend (port 8000) and Frontend (port 80) deployed successfully on AWS EC2!"
+            echo "🚀 DEV Backend (port 8000) and Frontend (port 80) deployed successfully on AWS EC2!"
