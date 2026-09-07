@@ -178,26 +178,43 @@ The canonical schema is in **`define/er-diagram.md`** (and `define/er-diagram.mm
 
 All JSON unless noted. Protected = requires `Authorization: Bearer <JWT>`; roles in parentheses.
 
-| Method | Endpoint | Protection | Purpose |
+> **API versioning:** every backend route lives under the **`/api/v1`** prefix (FastAPI router prefix). The frontend never writes `/api/v1` in code — its `VITE_API_BASE_URL` (and `VITE_WS_BASE_URL`) already contains the prefix, so the frontend only calls the short path, e.g. frontend `/menu` → real request `http://localhost:8000/api/v1/menu`.
+
+| Method | Endpoint (full path = `/api/v1` + this) | Protection | Purpose |
 |---|---|---|---|
-| `GET` | `/api/menu` | public | List menu grouped by category |
-| `POST` | `/api/menu` | **protected** (employee/admin) | Add menu item {name, price, description, category, prices} |
-| `DELETE` | `/api/menu/{menu_uuid}` | **protected** (employee/admin) | Remove menu item |
-| `POST` | `/api/payment/init` | public | Create sandbox payment session from cart + {table_name, customer_name, phone_number, payment_method} → returns gateway checkout/redirect |
-| `GET/POST` | `/api/payment/callback` | public (gateway callback) | Receive gateway result (success/fail/cancel) |
-| `GET` | `/api/payment/status/{order_ref}` | public | Frontend polls/validates payment outcome |
-| `POST` | `/api/orders` | public (server-invoked on payment success) | Persist order header + order_items, enqueue bill SMS, broadcast to kitchen WS |
-| `GET` | `/api/orders` | **protected** (employee/admin) | Orders for kitchen (FIFO) |
-| `POST` | `/api/auth/login` | public | {email, password} → JWT {token, role} |
-| `POST` | `/api/auth/signup` | public | {email, password, confirm} → validates email exists in accounts, sets hash → JWT |
-| `GET` | `/api/auth/me` | protected | Current user + role |
-| `GET` | `/api/admin/employees` | **protected** (admin) | All employees |
-| `POST` | `/api/admin/employees` | **protected** (admin) | Create employee {name, email} (password NULL) |
-| `DELETE` | `/api/admin/employees/{account_uuid}` | **protected** (admin) | Delete employee |
-| `GET` | `/api/order-history?from=&to=` | **protected** (admin) | Orders by date range |
-| `GET` | `/api/order-history/export.csv?from=&to=` | **protected** (admin) | CSV download of filtered orders |
+| `GET` | `/menu` | public | List menu grouped by category |
+| `POST` | `/menu` | **protected** (employee/admin) | Add menu item {name, price, description, category, prices} |
+| `DELETE` | `/menu/{menu_uuid}` | **protected** (employee/admin) | Remove menu item |
+| `POST` | `/payment` | public | Single payment endpoint — receives the **final** gateway result from the frontend (or gateway callback). Branches by status: **success** → insert `orders` + `order_items`, recompute prices, `payment_status='success'`, store `payment_transaction_id`, generate bill + SMS, broadcast kitchen WS; **failed / cancelled** → no order rows, return friendly error so the cart stays intact |
+| `GET` | `/orders` | **protected** (employee/admin) | Orders for kitchen (FIFO) |
+| `POST` | `/auth/login` | public | {email, password} → JWT {token, role} |
+| `POST` | `/auth/signup` | public | {email, password, confirm} → validates email exists in accounts, sets hash → JWT |
+| `GET` | `/auth/me` | protected | Current user + role |
+| `GET` | `/admin/employees` | **protected** (admin) | All employees |
+| `POST` | `/admin/employees` | **protected** (admin) | Create employee {name, email} (password NULL) |
+| `DELETE` | `/admin/employees/{account_uuid}` | **protected** (admin) | Delete employee |
+| `GET` | `/order-history?from=&to=` | **protected** (admin) | Orders by date range |
+| `GET` | `/order-history/export.csv?from=&to=` | **protected** (admin) | CSV download of filtered orders |
 | `WS` | `/ws/orders` | **token required** (employee/admin) | Live order stream to kitchen |
 | `WS` | `/ws/menu` | public (read updates) | Live menu change stream (add/remove/availability) to all viewers |
+
+**Payment endpoint behavior (single route, two workflows):**
+
+```
+POST /api/v1/payment {order_ref, gateway_status, transaction_id, ...}
+   │
+   ├─ status = success
+   │    → validate server-side → INSERT orders + order_items (update orders table)
+   │    → payment_status='success', store transaction_id, recompute total = sum of lines
+   │    → generate bill message + send SMS to phone_number
+   │    → broadcast new order to kitchen WS (FIFO)
+   │    → respond {status: 'success', order_number, total}
+   │
+   └─ status = failed | cancelled
+        → NO order rows created
+        → respond {status: 'failed'|'cancelled', message: 'Payment failed/cancelled, nothing was charged'}
+        → frontend shows friendly error in /cart, cart contents preserved
+```
 
 **Always enforce on the backend:** the /menu staff actions, /orders, /admin*, /order-history must validate the JWT and role. Do not rely on the frontend hiding buttons.
 
@@ -212,22 +229,23 @@ All JSON unless noted. Protected = requires `Authorization: Bearer <JWT>`; roles
 **State machine per order payment:**
 
 ```
-cart → init (creates order ref PENDING) → gateway sandbox redirect/checkout
-   → success  → persist order + items → SMS bill → kitchen WS broadcast → show success screen
-   → failed   → return to /cart → friendly error, cart preserved
-   → cancelled → return to /cart → friendly "cancelled, no charge" error, cart preserved
+cart → gateway sandbox redirect/checkout (customer pays)
+   → result comes back to POST /api/v1/payment
+   → status = success  → update orders table (insert order + items) → SMS bill → kitchen WS broadcast → success screen
+   → status = failed   → no order row → return to /cart → friendly error, cart preserved
+   → status = cancelled → no order row → return to /cart → friendly "cancelled, no charge" error, cart preserved
 ```
 
-- On **success**, the backend is the source of truth: it validates the gateway response, **then inserts `orders` + `order_items`** (pricing recomputed from DB prices & quantities; `unit_price` snapshot), stores `payment_transaction_id`, sets `payment_status='success'`.
-- **Failure/cancellation must NOT create order rows.**
-- Also handle gateway callback idempotency (do not double-insert if the callback/status is hit twice).
+- The **single `POST /api/v1/payment` endpoint** is the source of truth for the outcome. On **success** it validates the gateway response, **then inserts `orders` + `order_items`** (pricing recomputed from DB prices & quantities; `unit_price` snapshot), stores `payment_transaction_id`, sets `payment_status='success'`, sends the bill SMS, and broadcasts the order to the kitchen.
+- On **failure/cancellation it must NOT create order rows** — it just returns a friendly error/cancel message.
+- Handle idempotency: if the same `order_ref` reaches the endpoint twice, do not double-insert. If the order already exists with `payment_status='success'`, return the existing order.
 
 ---
 
 ## 8. Real-time Streaming (FastAPI WebSocket)
 
-1. **`/ws/menu`** — staff add/remove/availability changes are broadcast to every connected menu viewer (including the staff's own menu). Customers see updates without refresh ("no defects"). Availability & add/remove are pushed instantly.
-2. **`/ws/orders`** — when a payment succeeds and the order is persisted (Section 7), the backend broadcasts the new order to all connected kitchen boards. Kitchen renders **FIFO** (oldest first).
+1. **`/api/v1/ws/menu`** — staff add/remove/availability changes are broadcast to every connected menu viewer (including the staff's own menu). Customers see updates without refresh ("no defects"). Availability & add/remove are pushed instantly.
+2. **`/api/v1/ws/orders`** — when a payment succeeds and the order is persisted (Section 7), the backend broadcasts the new order to all connected kitchen boards. Kitchen renders **FIFO** (oldest first).
 
 Design: WebSocket connection per page; small manager in FastAPI (`ConnectionManager`) with `connect/disconnect/broadcast`. Menu WS is public; orders WS authenticates the token on connect with role check.
 
@@ -235,8 +253,13 @@ Design: WebSocket connection per page; small manager in FastAPI (`ConnectionMana
 
 ## 9. SMS — Bill Delivery
 
-- On successful order placement, generate a **bill message** (order number, items w/ qty+size, line & total, payment method, table name) and send it via SMS to `phone_number` captured at payment.
-- Wrap SMS in a service with a **mock/dev adapter** (log to console) and a pluggable real provider (e.g. Fast2SMS / Twilio / MSG91) behind env config. The bill format can be a plain-text friendly message.
+- On successful order placement, generate a **bill message** (order number, items w/ qty+size, line & total, payment method, table name) and send it via SMS to `phone_number` captured at payment. The bill format is a plain-text friendly message.
+- **SMS provider: Fast2SMS (free)** — chosen because it is the free-to-use Indian SMS service:
+  - **Free API key** is issued immediately from the Fast2SMS dashboard → "Dev API" section.
+  - **₹50 free wallet credit** is added after signup, so the bill SMS can be sent for real at zero cost during dev/demo.
+  - The **"Quick SMS" route** (`route=q`) works **without DLT registration**, so it can be used right away for testing (DLT/TRAI registration is only needed for production business SMS).
+  - REST API, Indian 10-digit numbers, simple `requests`/`httpx` call (see docs.fast2sms.com).
+- Wrap SMS in a service with a **mock adapter**: when `DEV_SMS_MOCK=true`, the bill is printed to the console and nothing is sent (so development runs offline). When `false`, it calls the Fast2SMS Quick SMS API with `DEV_FAST2SMS_API_KEY`.
 
 ---
 
@@ -248,63 +271,54 @@ Design: WebSocket connection per page; small manager in FastAPI (`ConnectionMana
 - Seed a sample menu with categories & prices in ₹ matching the reference site (Coffee, Cold Brew, Hot Luxury Teas, Coffee Beans).
 - Food images: use **placeholders** (branded color/grey boxes). A clear seam (one field/URL on the menu model or asset folder) must exist so real images can be dropped in later.
 
-### 10.2 Backend `.env` (FastAPI)
+### 10.2 Backend `.env` (FastAPI — DEV only)
+
+All keys are prefixed `DEV_` to make it explicit these are **dev/sandbox-only** settings (sandbox payment keys, free SMS key). Production would use entirely different live credentials — none of these ship to prod.
 
 | Variable | Example | Purpose |
 |---|---|---|
-| `APP_NAME` | `restaurant-api` | App identity |
-| `APP_ENV` | `development` | `development` / `staging` / `production` |
-| `HOST` / `PORT` | `0.0.0.0` / `8000` | Uvicorn bind |
-| `DATABASE_URL` | `postgresql+psycopg://user:pass@localhost:5432/restaurant` | DB driver/DSN (or SQLite `sqlite:///./restaurant.db` locally) |
-| `JWT_SECRET_KEY` | `change-me-strong-secret` | HMAC signing secret for JWT |
-| `JWT_ALGORITHM` | `HS256` | JWT signing algorithm |
-| `JWT_EXPIRE_MINUTES` | `480` | Token lifetime (8h work shift) |
-| `CORS_ORIGINS` | `http://localhost:5173,http://localhost:3000` | Comma-separated allowed frontend origins |
-| `PAYMENT_PROVIDER` | `razorpay` | `phonepay` or `razorpay` (switch in dev) |
-| `PHONEPE_MERCHANT_ID` | `MERCHANTUAT` (sandbox) | PhonePe sandbox merchant id |
-| `PHONEPE_BASE_URL` | `https://api-preprod.phonepe.com/apis/pg-sandbox` | PhonePe sandbox PG endpoint |
-| `PHONEPE_SALT_KEY` | (sandbox key) | PhonePe salt for checksum |
-| `PHONEPE_SALT_INDEX` | `1` | Salt index |
-| `PHONEPE_CALLBACK_URL` | `http://localhost:8000/api/payment/callback` | Where gateway returns the result |
-| `RAZORPAY_KEY_ID` | `rzp_test_xxxx` | Razorpay test-mode key id |
-| `RAZORPAY_KEY_SECRET` | (test secret) | Razorpay test-mode key secret |
-| `RAZORPAY_WEBHOOK_SECRET` | (test) | Good-to-have for server-side validation |
-| `SMS_PROVIDER` | `mock` | `mock` (dev) / `fast2sms` / `twilio` / `msg91` |
-| `SMS_MOCK` | `true` | `true` → print bill to console, never send |
-| `FAST2SMS_API_KEY` | (key) | Used when `SMS_PROVIDER=fast2sms` |
-| `FAST2SMS_SENDER_ID` | `SOROCO` | Sender id for Fast2SMS |
-| `TWILIO_ACCOUNT_SID` | (sid) | Used when `SMS_PROVIDER=twilio` |
-| `TWILIO_AUTH_TOKEN` | (token) | Twilio auth token |
-| `TWILIO_FROM_NUMBER` | `+1XXXXXXXXXX` | Twilio sender number |
-| `MSG91_AUTH_KEY` | (key) | Used when `SMS_PROVIDER=msg91` |
-| `SMS_SENDER_ID` | `SOROCO` | Generic sender id for SMS gateways |
+| `DEV_APP_NAME` | `Soroco House` | Brand name shown in SMS bill |
+| `DEV_PORT` | `8000` | Uvicorn bind port (`HOST` defaults to `0.0.0.0`) |
+| `DEV_DATABASE_URL` | `sqlite:///./restaurant.db` | DB driver/DSN (or Postgres locally) |
+| `DEV_JWT_SECRET_KEY` | `change-me-strong-secret` | HMAC signing secret for JWT (algorithm hardcoded `HS256`) |
+| `DEV_JWT_EXPIRE_MINUTES` | `480` | Token lifetime (8h work shift) |
+| `DEV_CORS_ORIGINS` | `http://localhost:5173,http://localhost:3000` | Comma-separated allowed frontend origins |
+| `DEV_PAYMENT_PROVIDER` | `razorpay` | `phonepay` or `razorpay` (sandbox switch) |
+| `DEV_PHONEPE_MERCHANT_ID` | `MERCHANTUAT` | PhonePe sandbox merchant id |
+| `DEV_PHONEPE_BASE_URL` | `https://api-preprod.phonepe.com/apis/pg-sandbox` | PhonePe sandbox PG endpoint |
+| `DEV_PHONEPE_SALT_KEY` | (sandbox key) | PhonePe salt for checksum |
+| `DEV_PHONEPE_SALT_INDEX` | `1` | PhonePe salt index (callback URL derived: `http://localhost:{DEV_PORT}/api/v1/payment`) |
+| `DEV_RAZORPAY_KEY_ID` | `rzp_test_xxxx` | Razorpay test-mode key id |
+| `DEV_RAZORPAY_KEY_SECRET` | (test secret) | Razorpay test-mode key secret |
+| `DEV_SMS_MOCK` | `true` | `true` → print bill to console, never send |
+| `DEV_FAST2SMS_API_KEY` | (free key) | Free Fast2SMS API key (Dev API section) |
+| `DEV_FAST2SMS_SENDER_ID` | `SOROCO` | Sender id for Fast2SMS Quick SMS route |
 
 ```dotenv
-# backend/.env sample
-APP_NAME=restaurant-api
-APP_ENV=development
-HOST=0.0.0.0
-PORT=8000
-DATABASE_URL=sqlite:///./restaurant.db
-JWT_SECRET_KEY=change-me-strong-secret
-JWT_ALGORITHM=HS256
-JWT_EXPIRE_MINUTES=480
-CORS_ORIGINS=http://localhost:5173,http://localhost:3000
-PAYMENT_PROVIDER=razorpay
-RAZORPAY_KEY_ID=rzp_test_xxxx
-RAZORPAY_KEY_SECRET=test-secret
-RAZORPAY_WEBHOOK_SECRET=test-webhook-secret
-SMS_PROVIDER=mock
-SMS_MOCK=true
+# backend/.env — DEV/sandbox only. Do NOT reuse these keys in production.
+DEV_APP_NAME=Soroco House
+DEV_PORT=8000
+DEV_DATABASE_URL=sqlite:///./restaurant.db
+DEV_JWT_SECRET_KEY=change-me-strong-secret
+DEV_JWT_EXPIRE_MINUTES=480
+DEV_CORS_ORIGINS=http://localhost:5173,http://localhost:3000
+DEV_PAYMENT_PROVIDER=razorpay
+DEV_RAZORPAY_KEY_ID=rzp_test_xxxx
+DEV_RAZORPAY_KEY_SECRET=test-secret
+DEV_SMS_MOCK=true
+DEV_FAST2SMS_API_KEY=your-free-fast2sms-api-key
+DEV_FAST2SMS_SENDER_ID=SOROCO
 ```
 
-### 10.3 Frontend `.env` (React/Vite — only `VITE_*` are exposed)
+### 10.3 Frontend `.env` (React/Vite)
+
+**Note on naming:** Vite only exposes env vars starting with `VITE_` to the browser, so frontend keys keep the `VITE_` prefix (a plain `DEV_` key would be invisible to React). The file `.env.development` itself marks these as dev-only.
 
 | Variable | Example | Purpose |
 |---|---|---|
 | `VITE_APP_NAME` | `Soroco House` | Brand name shown in UI |
-| `VITE_API_BASE_URL` | `http://localhost:8000` | REST API origin (no trailing slash) |
-| `VITE_WS_BASE_URL` | `ws://localhost:8000` | WebSocket origin (same backend) |
+| `VITE_API_BASE_URL` | `http://localhost:8000/api/v1` | REST API base (no trailing slash). Already contains the `/api/v1` prefix, so frontend code only writes short paths like `/menu`, `/payment` |
+| `VITE_WS_BASE_URL` | `ws://localhost:8000/api/v1` | WebSocket base (same backend). Connect to e.g. `ws://localhost:8000/api/v1/ws/menu` |
 | `VITE_RAZORPAY_KEY_ID` | `rzp_test_xxxx` | Razorpay checkout key id (client-side) — same test key as backend |
 | `VITE_PAYMENT_METHODS` | `phonepay,razorpay` | Which methods to render in the cart (comma-separated) |
 | `VITE_IMAGE_BASE_URL` | `/images` | Where food item images are served/uploaded; placeholder when empty |
@@ -312,14 +326,14 @@ SMS_MOCK=true
 ```dotenv
 # frontend/.env.development sample
 VITE_APP_NAME=Soroco House
-VITE_API_BASE_URL=http://localhost:8000
-VITE_WS_BASE_URL=ws://localhost:8000
+VITE_API_BASE_URL=http://localhost:8000/api/v1
+VITE_WS_BASE_URL=ws://localhost:8000/api/v1
 VITE_RAZORPAY_KEY_ID=rzp_test_xxxx
 VITE_PAYMENT_METHODS=phonepay,razorpay
 VITE_IMAGE_BASE_URL=/images
 ```
 
-> **Rules:** never commit real secrets (`.env` in `.gitignore`, provide `.env.example` files). Vite exposes **only** variables prefixed `VITE_`. Keep the same `RAZORPAY_KEY_ID` client & server-side; PhonePe is entirely server-side so no PhonePe keys appear in the frontend.
+> **Rules:** never commit real secrets (`.env` in `.gitignore`, provide `.env.example` files). All backend keys carry the `DEV_` prefix because they are dev/sandbox-only — sandbox payment keys and the free Fast2SMS key must never be used in production. Keep the same `RAZORPAY_KEY_ID` client & server-side; PhonePe is entirely server-side so no PhonePe keys appear in the frontend.
 
 ---
 
