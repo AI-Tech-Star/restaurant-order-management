@@ -21,6 +21,8 @@ erDiagram
         decimal standard_price
         decimal small_price
         decimal large_price
+        varchar image_url NULL
+        boolean is_available
         timestamp created_at
         varchar created_by
         timestamp updated_at
@@ -37,6 +39,8 @@ erDiagram
         enum payment_method
         enum payment_status
         varchar payment_transaction_id
+        enum kitchen_status
+        enum order_status
         decimal total_price
         timestamp created_at
         varchar created_by

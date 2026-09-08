@@ -29,6 +29,8 @@
 | standard_price | DECIMAL(10,2), NULL |
 | small_price | DECIMAL(10,2), NULL |
 | large_price | DECIMAL(10,2), NULL |
+| image_url | VARCHAR(500), NULL |
+| is_available | BOOLEAN, NOT NULL, DEFAULT TRUE |
 | created_at | TIMESTAMP, NOT NULL |
 | created_by | VARCHAR(255), NOT NULL |
 | updated_at | TIMESTAMP, NULL |
@@ -47,6 +49,8 @@
 | payment_method | ENUM('phonepay', 'razorpay'), NOT NULL |
 | payment_status | ENUM('success', 'failed', 'cancelled'), NOT NULL |
 | payment_transaction_id | varchar(255), NULL |
+| kitchen_status | ENUM('in_queue', 'preparing', 'prepared'), NOT NULL, DEFAULT 'in_queue' |
+| order_status | ENUM('ordered', 'delivered'), NOT NULL, DEFAULT 'ordered' |
 | total_price | DECIMAL(10,2), NOT NULL |
 | created_at | TIMESTAMP, NOT NULL |
 | created_by | VARCHAR(255), NOT NULL |
@@ -87,18 +91,18 @@
 
 ### menu Data
 
-| menu_uuid | menu_id | category | item_name | item_description | standard_price | small_price | large_price |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| m111... | 101 | Hot Luxury Teas | Lavender Earl Grey | Clean, Floral | 140.00 | NULL | NULL |
-| m222... | 102 | Cold Brew | Classic Cold Brew | NULL | NULL | 140.00 | 180.00 |
-| m333... | 103 | Coffee Beans | Dark Blend Bag | Strong profile | 450.00 | NULL | NULL |
+| menu_uuid | menu_id | category | item_name | item_description | standard_price | small_price | large_price | image_url | is_available |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| m111... | 101 | Hot Luxury Teas | Lavender Earl Grey | Clean, Floral | 140.00 | NULL | NULL | NULL | TRUE |
+| m222... | 102 | Cold Brew | Classic Cold Brew | NULL | NULL | 140.00 | 180.00 | NULL | TRUE |
+| m333... | 103 | Coffee Beans | Dark Blend Bag | Strong profile | 450.00 | NULL | NULL | NULL | FALSE |
 
 ### orders Data
 
-| order_uuid | order_id | order_number | table_name | customer_name | phone_number | payment_method | payment_status | payment_transaction_id | total_price |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| o999... | 5001 | 12 | A1 | Alex | +1234567890 | phonepay | success | txn_abc123 | 320.00 |
-| o888... | 5002 | 13 | B2 | Sam | +1987654321 | razorpay | success | txn_xyz789 | 180.00 |
+| order_uuid | order_id | order_number | table_name | customer_name | phone_number | payment_method | payment_status | payment_transaction_id | kitchen_status | order_status | total_price |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| o999... | 5001 | 12 | A1 | Alex | +1234567890 | phonepay | success | txn_abc123 | prepared | delivered | 320.00 |
+| o888... | 5002 | 13 | B2 | Sam | +1987654321 | razorpay | success | txn_xyz789 | in_queue | ordered | 180.00 |
 
 ### order_items Data
 
