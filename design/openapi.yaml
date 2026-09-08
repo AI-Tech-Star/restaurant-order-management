@@ -19,10 +19,12 @@ info:
     - All routes are under the /api/v1 prefix (this server URL). The frontend
       never writes /api/v1 in code; its VITE_API_BASE_URL already carries it.
     - Protected routes use `Authorization: Bearer <JWT>`.
-    - Kitchen order status (In-Queue/Preparing/Prepared) and menu "availability"
-      are frontend-only and are NOT part of this API. Real-time menu and order
-      events stream over WebSockets (documented in design/api-docs.md):
-      ws /api/v1/ws/menu (public) and ws /api/v1/ws/orders (bearer token).
+    - Kitchen order status (In-Queue/Preparing/Prepared), order lifecycle
+      (Ordered/Delivered) and menu availability are PERSISTED server-side and
+      updated via PATCH /menu/{menu_uuid} and PATCH /orders/{order_uuid}.
+      Real-time menu and order events stream over WebSockets (documented in
+      design/api-docs.md): ws /api/v1/ws/menu (public) and
+      ws /api/v1/ws/orders (bearer token).
   contact:
     name: Soroco House Dev Team
 
@@ -77,8 +79,9 @@ paths:
       summary: List menu grouped by category
       description: |
         Public endpoint. Returns the full menu grouped by category for the
-        customer /menu page. Availability is intentionally NOT stored in the
-        backend, so it is not present here.
+        customer /menu page. Unavailable items (is_available=false) are still
+        returned and are greyed out client-side for customers; staff see them
+        so they can re-enable.
       operationId: listMenu
       tags:
         - Menu
@@ -105,6 +108,7 @@ paths:
                               item_name: "Lavender Earl Grey"
                               item_description: "Clean, Floral"
                               image_url: null
+                              is_available: true
                               prices:
                                 standard_price: 140.00
                                 small_price: null
@@ -116,6 +120,7 @@ paths:
                               item_name: "Classic Cold Brew"
                               item_description: null
                               image_url: null
+                              is_available: true
                               prices:
                                 standard_price: null
                                 small_price: 140.00
@@ -182,6 +187,7 @@ paths:
                       category: "Hot Luxury Teas"
                       item_description: "Clean, Floral"
                       image_url: null
+                      is_available: true
                       prices:
                         standard_price: 140.00
                         small_price: null
@@ -203,6 +209,84 @@ paths:
           $ref: '#/components/responses/internal_error'
 
   /menu/{menu_uuid}:
+    patch:
+      summary: Update a menu item (availability, prices, text)
+      description: |
+        Staff only (employee or admin). Validates the JWT on the backend and
+        updates the item. Used mainly for the availability toggle
+        (is_available) but accepts any editable field. The change is broadcast
+        to connected menu viewers over WebSocket.
+      operationId: updateMenuItem
+      tags:
+        - Menu
+      security:
+        - bearer_auth: []
+      parameters:
+        - name: menu_uuid
+          in: path
+          required: true
+          description: Menu item UUID to update.
+          schema:
+            type: string
+            format: uuid
+            example: "m1111111-1111-1111-1111-111111111111"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMenuItemRequest'
+            examples:
+              toggle_unavailable:
+                summary: Mark item unavailable
+                value:
+                  is_available: false
+              edit_prices:
+                summary: Update prices
+                value:
+                  small_price: 150.00
+                  large_price: 190.00
+      responses:
+        '200':
+          description: Menu item updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                updated:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Menu item updated successfully"
+                    data:
+                      menu_uuid: "m1111111-1111-1111-1111-111111111111"
+                      item_name: "Lavender Earl Grey"
+                      category: "Hot Luxury Teas"
+                      item_description: "Clean, Floral"
+                      image_url: null
+                      is_available: false
+                      prices:
+                        standard_price: 140.00
+                        small_price: null
+                        large_price: null
+                    errors: []
+                    timestamp: "2026-09-07T10:33:00.123Z"
+                    request_id: "req-d1e2f3a4-5b6c-4d7e-8f0a-1b2c3d4e5f6a"
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '403':
+          $ref: '#/components/responses/forbidden'
+        '404':
+          description: Menu item not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          $ref: '#/components/responses/validation_error'
+        '500':
+          $ref: '#/components/responses/internal_error'
     delete:
       summary: Remove a menu item
       description: |
@@ -435,9 +519,10 @@ paths:
     get:
       summary: List kitchen orders in FIFO order
       description: |
-        Staff only (employee or admin). Returns all placed orders, oldest first.
-        Order status (In-Queue/Preparing/Prepared) is frontend-only and is NOT
-        returned here. Live new orders arrive over WebSocket /api/v1/ws/orders.
+        Staff only (employee or admin). Returns all placed orders, oldest first
+        (FIFO). Includes kitchen_status and order_status so the kitchen board
+        restores its state after a page refresh. New orders and status changes
+        arrive over WebSocket /api/v1/ws/orders.
       operationId: listKitchenOrders
       tags:
         - Orders
@@ -464,6 +549,8 @@ paths:
                           customer_name: "Alex"
                           phone_number: "+919876543210"
                           payment_method: "razorpay"
+                          kitchen_status: "in_queue"
+                          order_status: "ordered"
                           total_price: 460.00
                           placed_at: "2026-09-07T10:36:12.123Z"
                           items:
@@ -484,6 +571,79 @@ paths:
           $ref: '#/components/responses/unauthorized'
         '403':
           $ref: '#/components/responses/forbidden'
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  /orders/{order_uuid}:
+    patch:
+      summary: Update order status (kitchen board)
+      description: |
+        Staff only (employee or admin). Updates kitchen_status
+        (in_queue | preparing | prepared) or order_status (delivered).
+        Validation is enum-only: any value from the target column's ENUM is
+        accepted — no enforced transition order. The change is broadcast to all
+        connected kitchen boards over WebSocket.
+      operationId: updateOrderStatus
+      tags:
+        - Orders
+      security:
+        - bearer_auth: []
+      parameters:
+        - name: order_uuid
+          in: path
+          required: true
+          description: Order UUID to update.
+          schema:
+            type: string
+            format: uuid
+            example: "o9999999-9999-9999-9999-999999999999"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrderStatusRequest'
+            examples:
+              preparing:
+                summary: Move an order to Preparing
+                value:
+                  kitchen_status: "preparing"
+              delivered:
+                summary: Mark order delivered
+                value:
+                  order_status: "delivered"
+      responses:
+        '200':
+          description: Order status updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                updated:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Order status updated successfully"
+                    data:
+                      order_uuid: "o9999999-9999-9999-9999-999999999999"
+                      kitchen_status: "preparing"
+                      order_status: "ordered"
+                    errors: []
+                    timestamp: "2026-09-07T10:38:00.123Z"
+                    request_id: "req-1b2c3d4e-5f6a-4b7c-9d8e-0a1b2c3d4e5f"
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '403':
+          $ref: '#/components/responses/forbidden'
+        '404':
+          description: Order not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          $ref: '#/components/responses/validation_error'
         '500':
           $ref: '#/components/responses/internal_error'
 
@@ -583,6 +743,25 @@ paths:
                     request_id: "req-3a4b5c6d-7e8f-4a9b-8c0d-1a2b3c4d5e6f"
         '422':
           $ref: '#/components/responses/validation_error'
+        '429':
+          description: Too many login attempts — rate limited (5/min per IP)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                rate_limited:
+                  value:
+                    status: "error"
+                    code: 429
+                    message: "Too Many Requests"
+                    data: null
+                    errors:
+                      - field: "email"
+                        code: "RATE_LIMIT_EXCEEDED"
+                        message: "Too many attempts. Please wait a minute and try again."
+                    timestamp: "2026-09-07T10:40:03.123Z"
+                    request_id: "req-4a5b6c7d-8e9f-4a0b-8c1d-2a3b4c5d6e7f"
         '500':
           $ref: '#/components/responses/internal_error'
 
@@ -741,6 +920,25 @@ paths:
                     request_id: "req-8a9b0c1d-2e3f-4a4b-9c5d-6a7b8c9d0e1f"
         '422':
           $ref: '#/components/responses/validation_error'
+        '429':
+          description: Too many signup attempts — rate limited (5/min per IP)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                rate_limited:
+                  value:
+                    status: "error"
+                    code: 429
+                    message: "Too Many Requests"
+                    data: null
+                    errors:
+                      - field: "email"
+                        code: "RATE_LIMIT_EXCEEDED"
+                        message: "Too many attempts. Please wait a minute and try again."
+                    timestamp: "2026-09-07T10:42:03.123Z"
+                    request_id: "req-9a8b7c6d-5e4f-4a3b-9c2d-1a2b3c4d5e6f"
         '500':
           $ref: '#/components/responses/internal_error'
 
@@ -977,6 +1175,7 @@ paths:
       description: |
         Admin only. Returns all placed orders within [from, to]. The frontend
         maps its Today / Yesterday / Custom presets into from/to values.
+        Optionally filter by order_status (ordered | delivered).
       operationId: getOrderHistory
       tags:
         - Admin
@@ -999,6 +1198,14 @@ paths:
             type: string
             format: date-time
             example: "2026-09-07T23:59:59Z"
+        - name: order_status
+          in: query
+          required: false
+          description: Filter by lifecycle status. Omit for all.
+          schema:
+            type: string
+            enum: [ordered, delivered]
+            example: "delivered"
       responses:
         '200':
           description: Orders retrieved
@@ -1021,6 +1228,8 @@ paths:
                           phone_number: "+919876543210"
                           payment_method: "razorpay"
                           payment_status: "success"
+                          kitchen_status: "in_queue"
+                          order_status: "ordered"
                           total_price: 460.00
                           items:
                             - item_name: "Classic Cold Brew"
@@ -1050,10 +1259,11 @@ paths:
     get:
       summary: Export orders as CSV
       description: |
-        Admin only. Downloads the filtered orders as a CSV attachment.
-        Columns: order_number, placed_at, table_name, customer_name,
-        phone_number, items (e.g. "2x Classic Cold Brew (large)"), total_price,
-        payment_method, payment_status.
+        Admin only. Downloads the filtered orders as a CSV attachment. Same
+        from/to/order_status filters as GET /order-history. Columns:
+        order_number, placed_at, table_name, customer_name, phone_number,
+        items (e.g. "2x Classic Cold Brew (large)"), total_price,
+        payment_method, payment_status, order_status, kitchen_status.
       operationId: exportOrderHistoryCsv
       tags:
         - Admin
@@ -1076,6 +1286,14 @@ paths:
             type: string
             format: date-time
             example: "2026-09-07T23:59:59Z"
+        - name: order_status
+          in: query
+          required: false
+          description: Filter by lifecycle status. Omit for all.
+          schema:
+            type: string
+            enum: [ordered, delivered]
+            example: "delivered"
       responses:
         '200':
           description: CSV file download
@@ -1092,8 +1310,8 @@ paths:
                 csv:
                   summary: CSV rows
                   value: |
-                    order_number,placed_at,table_name,customer_name,phone_number,items,total_price,payment_method,payment_status
-                    12,2026-09-07T10:36:12.123Z,A1,Alex,+919876543210,"2x Classic Cold Brew (large)",460.00,razorpay,success
+                    order_number,placed_at,table_name,customer_name,phone_number,items,total_price,payment_method,payment_status,order_status,kitchen_status
+                    12,2026-09-07T10:36:12.123Z,A1,Alex,+919876543210,"2x Classic Cold Brew (large)",460.00,razorpay,success,ordered,in_queue
         '401':
           $ref: '#/components/responses/unauthorized'
         '403':
@@ -1238,6 +1456,55 @@ components:
           format: double
           nullable: true
           example: 180.00
+
+    UpdateMenuItemRequest:
+      type: object
+      description: Any supplied field is updated. is_available drives the availability toggle (persisted).
+      properties:
+        item_name:
+          type: string
+          maxLength: 255
+          example: "Lavender Earl Grey"
+        category:
+          type: string
+          maxLength: 100
+          example: "Hot Luxury Teas"
+        item_description:
+          type: string
+          nullable: true
+          example: "Clean, Floral"
+        standard_price:
+          type: number
+          format: double
+          nullable: true
+          example: 140.00
+        small_price:
+          type: number
+          format: double
+          nullable: true
+          example: 150.00
+        large_price:
+          type: number
+          format: double
+          nullable: true
+          example: 190.00
+        is_available:
+          type: boolean
+          description: false greys the item out for customers.
+          example: false
+
+    UpdateOrderStatusRequest:
+      type: object
+      description: Supply either kitchen_status or order_status (or both). Enum-only validation — any ENUM value is accepted, no enforced transition order.
+      properties:
+        kitchen_status:
+          type: string
+          enum: [in_queue, preparing, prepared]
+          example: "preparing"
+        order_status:
+          type: string
+          enum: [ordered, delivered]
+          example: "delivered"
 
     PaymentInitRequest:
       type: object

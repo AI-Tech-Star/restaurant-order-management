@@ -27,8 +27,8 @@ http://localhost:8000/api/v1
 |---|---|---|---|
 | `GET /health` | ✔ | ✔ | ✔ |
 | `GET /menu`, `POST /payment` | ✔ | ✔ | ✔ |
-| `POST /menu`, `DELETE /menu/{id}`, `GET /orders` | ✖ | ✔ | ✔ |
-| `/auth/*` (login, check-email, signup, me) | login/signup public; `me` = staff | ✔ | ✔ |
+| `POST /menu`, `PATCH /menu/{uuid}`, `DELETE /menu/{uuid}`, `GET /orders`, `PATCH /orders/{uuid}` | ✖ | ✔ | ✔ |
+| `/auth/*` (login, check-email, signup, me) | login/signup/check-email public; `me` = staff | ✔ | ✔ |
 | `GET /admin/employees`, `POST /admin/employees`, `DELETE /admin/employees/{id}` | ✖ | ✖ | ✔ |
 | `GET /order-history`, `GET /order-history/export.csv` | ✖ | ✖ | ✔ |
 
@@ -75,6 +75,7 @@ http://localhost:8000/api/v1
 | `404` | Not found (`ACCOUNT_NOT_FOUND`, `ORDER_REF_NOT_FOUND`, …) |
 | `409` | Conflict (`EMAIL_ALREADY_EXISTS`, `ACCOUNT_ALREADY_SIGNED_UP`, `ADMIN_DELETE_FORBIDDEN`) |
 | `422` | `VALIDATION_ERROR` — malformed/missing fields |
+| `429` | `RATE_LIMIT_EXCEEDED` — too many login/signup attempts (5/min per IP) |
 | `500` | `INTERNAL_ERROR` |
 
 ---
@@ -86,9 +87,11 @@ http://localhost:8000/api/v1
 | `GET` | `/health` | — | Health check |
 | `GET` | `/menu` | — | Menu grouped by category |
 | `POST` | `/menu` | emp/admin | Add menu item |
+| `PATCH` | `/menu/{menu_uuid}` | emp/admin | Update item (availability/prices) |
 | `DELETE` | `/menu/{menu_uuid}` | emp/admin | Remove menu item |
 | `POST` | `/payment` | — | Pay — one endpoint, two calls (below) |
 | `GET` | `/orders` | emp/admin | Kitchen board, FIFO |
+| `PATCH` | `/orders/{order_uuid}` | emp/admin | Update kitchen/order status |
 | `POST` | `/auth/login` | — | Login → JWT + role |
 | `POST` | `/auth/check-email` | — | Signup step 1: is this email a staff account? |
 | `POST` | `/auth/signup` | — | Set password for pre-created account → JWT |
@@ -96,8 +99,8 @@ http://localhost:8000/api/v1
 | `GET` | `/admin/employees` | admin | List employees |
 | `POST` | `/admin/employees` | admin | Create employee (name + email) |
 | `DELETE` | `/admin/employees/{account_uuid}` | admin | Delete employee |
-| `GET` | `/order-history?from=&to=` | admin | Orders by date range |
-| `GET` | `/order-history/export.csv?from=&to=` | admin | CSV export of the range |
+| `GET` | `/order-history?from=&to=&order_status=` | admin | Orders by date range (+ status filter) |
+| `GET` | `/order-history/export.csv?from=&to=&order_status=` | admin | CSV export of the filtered range |
 
 ### 4.1 `GET /health`
 
@@ -123,6 +126,7 @@ Response `data`:
           "item_name": "Lavender Earl Grey",
           "item_description": "Clean, Floral",
           "image_url": null,
+          "is_available": true,
           "prices": { "standard_price": 140.00, "small_price": null, "large_price": null }
         }
       ]
@@ -131,8 +135,11 @@ Response `data`:
 }
 ```
 
-- Availability is **not** returned — it is frontend-only state (toggled by staff and
-  streamed over `WS /ws/menu`).
+- **All** items are returned, including `is_available: false` ones. The frontend
+  greys them out for customers (and disables `+`); staff still see them so they
+  can re-enable.
+- Availability **is persisted** server-side (see §4.4 `PATCH /menu/{menu_uuid}`)
+  and survives server restarts.
 
 ### 4.3 `POST /menu` (staff: employee/admin)
 
@@ -149,9 +156,26 @@ Add a new item. At least **one** price is required.
 }
 ```
 
-`201` → `data` = the created item (same shape as above). Broadcast to menu viewers over WS.
+`201` → `data` = the created item (same shape as §4.2 above, `is_available` defaults to `true`, `image_url` `null`). Broadcast to menu viewers over WS.
 
-### 4.4 `DELETE /menu/{menu_uuid}` (staff)
+### 4.4 `PATCH /menu/{menu_uuid}` (staff: employee/admin)
+
+Update an item — mainly the availability toggle, but any editable field.
+
+```json
+{ "is_available": false }
+```
+
+or prices / text:
+
+```json
+{ "small_price": 150.00, "large_price": 190.00 }
+```
+
+`200` → `data` = the updated item (same shape as §4.2). `404` if the item does
+not exist. The change is **persisted** and broadcast to menu viewers over WS.
+
+### 4.5 `DELETE /menu/{menu_uuid}` (staff)
 
 ```
 DELETE /api/v1/menu/m1111111-1111-1111-1111-111111111111
@@ -159,7 +183,7 @@ DELETE /api/v1/menu/m1111111-1111-1111-1111-111111111111
 
 `200` → `data: null`. `404` if the item does not exist. Broadcast over WS.
 
-### 4.5 `POST /payment` — ONE endpoint, TWO calls
+### 4.6 `POST /payment` — ONE endpoint, TWO calls
 
 The single payment route. The backend is the source of truth for the total.
 
@@ -218,8 +242,9 @@ For **phonepay**, `checkout` is instead:
 }
 ```
 
-- **`success`** → order header + items inserted, bill SMS sent to `phone_number`,
-  order broadcast to the kitchen. `200`:
+- **`success`** → order header + items inserted (with `kitchen_status='in_queue'`,
+  `order_status='ordered'`), bill SMS sent to `phone_number`, order broadcast to
+  the kitchen. `200`:
 
 ```json
 {
@@ -252,10 +277,11 @@ For **phonepay**, `checkout` is instead:
 
 Idempotency: confirming the same `order_ref` twice returns the existing order — never a duplicate.
 
-### 4.6 `GET /orders` (staff: employee/admin)
+### 4.7 `GET /orders` (staff: employee/admin)
 
-Kitchen board. Response `data.orders` is **oldest first (FIFO)**. No status field
-(status In-Queue/Preparing/Prepared is frontend-only).
+Kitchen board. Response `data.orders` is **oldest first (FIFO)**. Each order
+carries its persisted kitchen/order status so the board restores state after a
+page refresh.
 
 ```json
 {
@@ -267,6 +293,8 @@ Kitchen board. Response `data.orders` is **oldest first (FIFO)**. No status fiel
       "customer_name": "Alex",
       "phone_number": "+919876543210",
       "payment_method": "razorpay",
+      "kitchen_status": "in_queue",
+      "order_status": "ordered",
       "total_price": 460.00,
       "placed_at": "2026-09-07T10:36:12.123Z",
       "items": [
@@ -277,7 +305,26 @@ Kitchen board. Response `data.orders` is **oldest first (FIFO)**. No status fiel
 }
 ```
 
-### 4.7 `POST /auth/login`
+### 4.8 `PATCH /orders/{order_uuid}` (staff: employee/admin)
+
+Update the kitchen board status. Validation is **enum-only** — any value from
+the column's ENUM is accepted, no enforced transition order.
+
+```json
+{ "kitchen_status": "preparing" }
+```
+
+or mark the order delivered:
+
+```json
+{ "order_status": "delivered" }
+```
+
+`200` → `data: { order_uuid, kitchen_status, order_status }`. `404` unknown order,
+`422` invalid value. The change is **persisted** and broadcast to all kitchen
+boards over WS.
+
+### 4.9 `POST /auth/login`
 
 ```json
 { "email": "thameem@restaurant.com", "password": "supersecret123" }
@@ -298,9 +345,9 @@ Kitchen board. Response `data.orders` is **oldest first (FIFO)**. No status fiel
 ```
 
 Errors: `401 INVALID_CREDENTIALS`, `403 SIGNUP_PENDING` (account has no password yet —
-direct the user to `/signup`).
+direct the user to `/signup`), `429` rate limited (5/min per IP).
 
-### 4.8 `POST /auth/check-email` (signup step 1)
+### 4.10 `POST /auth/check-email` (signup step 1)
 
 ```json
 { "email": "prathick@restaurant.com" }
@@ -310,7 +357,7 @@ direct the user to `/signup`).
 - `404` → `errors[0].code = "ACCOUNT_NOT_FOUND"`, message
   *"Invalid email address. Ask an admin to add you first."* — frontend shows the friendly error.
 
-### 4.9 `POST /auth/signup`
+### 4.11 `POST /auth/signup`
 
 Password confirm is **client-side only** (not sent to the API).
 
@@ -319,13 +366,14 @@ Password confirm is **client-side only** (not sent to the API).
 ```
 
 `200` → same shape as login (JWT with role `employee`). Errors:
-`404 ACCOUNT_NOT_FOUND`, `409 ACCOUNT_ALREADY_SIGNED_UP`, `422` (password < 8 chars).
+`404 ACCOUNT_NOT_FOUND`, `409 ACCOUNT_ALREADY_SIGNED_UP`, `422` (password < 8 chars),
+`429` rate limited.
 
-### 4.10 `GET /auth/me`
+### 4.12 `GET /auth/me`
 
 `200` → `data: { "account_uuid", "name", "email", "role" }`. `401` without a valid token.
 
-### 4.11 `GET /admin/employees` (admin)
+### 4.13 `GET /admin/employees` (admin)
 
 `200` →
 
@@ -339,7 +387,7 @@ Password confirm is **client-side only** (not sent to the API).
 
 `has_password` tells the admin who still needs to complete `/signup`.
 
-### 4.12 `POST /admin/employees` (admin)
+### 4.14 `POST /admin/employees` (admin)
 
 ```json
 { "name": "Prathick", "email": "prathick@restaurant.com" }
@@ -348,7 +396,7 @@ Password confirm is **client-side only** (not sent to the API).
 `201` → created account (role `employee`, `has_password: false`).
 `409 EMAIL_ALREADY_EXISTS`, `422` when fields invalid.
 
-### 4.13 `DELETE /admin/employees/{account_uuid}` (admin)
+### 4.15 `DELETE /admin/employees/{account_uuid}` (admin)
 
 ```
 DELETE /api/v1/admin/employees/e5f6g7h8-9012-3456-7890-abcdef123456
@@ -356,23 +404,24 @@ DELETE /api/v1/admin/employees/e5f6g7h8-9012-3456-7890-abcdef123456
 
 `200` → `data: null`. `404` not found. `409 ADMIN_DELETE_FORBIDDEN` if the target is an admin.
 
-### 4.14 `GET /order-history?from=&to=` (admin)
+### 4.16 `GET /order-history?from=&to=&order_status=` (admin)
 
 ```
-GET /api/v1/order-history?from=2026-09-07T00:00:00Z&to=2026-09-07T23:59:59Z
+GET /api/v1/order-history?from=2026-09-07T00:00:00Z&to=2026-09-07T23:59:59Z&order_status=delivered
 ```
 
 The frontend’s Today / Yesterday / Custom presets are converted into `from`/`to`.
-Response `data.orders` = same order shape as `GET /orders` plus `payment_status`.
+`order_status` is optional (`ordered` | `delivered`; omit for all). Response
+`data.orders` = same order shape as `GET /orders` plus `payment_status`.
 
-### 4.15 `GET /order-history/export.csv?from=&to=` (admin)
+### 4.17 `GET /order-history/export.csv?from=&to=&order_status=` (admin)
 
-Same range query. Returns `text/csv` with `Content-Disposition: attachment`.
+Same filters as §4.16. Returns `text/csv` with `Content-Disposition: attachment`.
 Columns:
 
 ```
-order_number, placed_at, table_name, customer_name, phone_number, items, total_price, payment_method, payment_status
-12,2026-09-07T10:36:12.123Z,A1,Alex,+919876543210,"2x Classic Cold Brew (large)",460.00,razorpay,success
+order_number, placed_at, table_name, customer_name, phone_number, items, total_price, payment_method, payment_status, order_status, kitchen_status
+12,2026-09-07T10:36:12.123Z,A1,Alex,+919876543210,"2x Classic Cold Brew (large)",460.00,razorpay,success,ordered,in_queue
 ```
 
 ---
@@ -393,12 +442,12 @@ refresh**. Message types (all `application/json`, server → client):
 
 | `event` | Payload |
 |---|---|
-| `menu_added` | `{ "item": { menu_uuid, item_name, category, item_description, image_url, prices:{standard_price, small_price, large_price} } }` |
+| `menu_added` | `{ "item": { menu_uuid, item_name, category, item_description, image_url, is_available, prices:{standard_price, small_price, large_price} } }` |
+| `menu_updated` | `{ "item": { ...same shape... } }` — sent after `PATCH /menu/{menu_uuid}` (availability toggle and/or price/text edits); **persisted** server-side |
 | `menu_removed` | `{ "menu_uuid": "..." }` |
-| `menu_availability` | `{ "menu_uuid": "...", "available": false }` — frontend-only toggle broadcast from the staff UI; never persisted |
 
 Client does not send messages; it only applies these events to the menu state
-(grey-out + disable `+` when `available: false`).
+(grey-out + disable `+` when `is_available: false`).
 
 ### 5.2 `WS /ws/orders` (staff: employee/admin)
 
@@ -409,14 +458,15 @@ ws://localhost:8000/api/v1/ws/orders?token=<JWT>
 ```
 
 The server validates the token + role on the handshake; unauthorized connects are
-rejected. Message type (server → client):
+rejected. Message types (server → client):
 
 | `event` | Payload |
 |---|---|
-| `new_order` | the order object (same shape as an entry in `GET /orders` at §4.6) — append to the FIFO kitchen list |
+| `new_order` | the order object (same shape as an entry in `GET /orders` at §4.7) — append to the FIFO kitchen list |
+| `order_status_updated` | `{ "order_uuid": "...", "kitchen_status": "...", "order_status": "..." }` — sent after `PATCH /orders/{order_uuid}` so open boards stay in sync |
 
 When the order page loads, fetch the existing FIFO list from `GET /orders`, then
-append `new_order` events as they arrive.
+append `new_order` / apply `order_status_updated` events as they arrive.
 
 ### 5.3 Reconnect behavior
 
@@ -430,7 +480,11 @@ append `new_order` events as they arrive.
 
 - **Never trust the client** for prices/totals; recompute server-side at payment init.
 - **Backend must validate the JWT + role on every staff write** (`POST /menu`,
-  `DELETE /menu/...`, `/orders`, `/admin/*`, `/order-history`, `/order-history/export.csv`).
+  `PATCH /menu/...`, `DELETE /menu/...`, `/orders`, `PATCH /orders/...`, `/admin/*`,
+  `/order-history`, `/order-history/export.csv`).
+- `menu.is_available`, `orders.kitchen_status` and `orders.order_status` are
+  **persisted** — update them only through their PATCH endpoints; never treat
+  them as frontend-only.
 - Payment keys are **sandbox only** (`DEV_` prefix in the backend `.env`), SMS is
   Fast2SMS free key (`DEV_FAST2SMS_API_KEY`, `DEV_SMS_MOCK` toggle).
 - Order number is the customer-facing number shown on the success screen and SMS bill.

@@ -96,6 +96,7 @@ If the session JWT exists **and** the role is `employee` or `admin`, the same me
 - Backend validates credentials, and on success **issues a JWT with the role** from the DB → redirect to the originally requested page (`/orders` or `/admin`).
 - Below the password field: **"Don't have an account? Please signup."** → link to `/signup`.
 - Wrong credentials → friendly inline error.
+- **Special case:** if the email exists but the account has no password yet (admin pre-created it), the backend returns `403 SIGNUP_PENDING` → frontend redirects the user to `/signup` instead of showing a credentials error.
 
 ### 4.5 `/signup` — Staff account password setup
 
@@ -189,13 +190,14 @@ All JSON unless noted. Protected = requires `Authorization: Bearer <JWT>`; roles
 
 | Method | Endpoint (full path = `/api/v1` + this) | Protection | Purpose |
 |---|---|---|---|
+| `GET` | `/health` | public | Liveness probe (health check) |
 | `GET` | `/menu` | public | List ALL menu items grouped by category (includes `is_available`, `image_url`). **Unavailable items are still returned** — the frontend greys them out for customers, while staff see them to re-enable |
 | `POST` | `/menu` | **protected** (employee/admin) | Add menu item {name, price, description, category, prices} |
 | `PATCH` | `/menu/{menu_uuid}` | **protected** (employee/admin) | Update item (availability toggle / `is_available`, prices, etc.) |
 | `DELETE` | `/menu/{menu_uuid}` | **protected** (employee/admin) | Remove menu item |
 | `POST` | `/payment` | public | Single payment endpoint — receives the **final** gateway result from the frontend (or gateway callback). Branches by status: **success** → insert `orders` + `order_items`, recompute prices, `payment_status='success'`, `kitchen_status='in_queue'`, `order_status='ordered'`, store `payment_transaction_id`, generate bill + SMS, broadcast kitchen WS; **failed / cancelled** → no order rows, return friendly error so the cart stays intact |
 | `GET` | `/orders` | **protected** (employee/admin) | Orders for kitchen (FIFO, includes `kitchen_status` + `order_status`) |
-| `PATCH` | `/orders/{order_uuid}` | **protected** (employee/admin) | Update `kitchen_status` (in_queue/preparing/prepared) or `order_status` (delivered) |
+| `PATCH` | `/orders/{order_uuid}` | **protected** (employee/admin) | Update `kitchen_status` or `order_status`. **Validation = enum only:** value must be one of the column's ENUM values (`in_queue`/`preparing`/`prepared` or `ordered`/`delivered`). No enforced transition order — staff may jump or revert freely |
 | `POST` | `/auth/login` | public | {email, password} → JWT {token, role} |
 | `POST` | `/auth/signup` | public | {email, password, confirm} → validates email exists in accounts, sets hash → JWT |
 | `GET` | `/auth/me` | protected | Current user + role |
@@ -214,7 +216,7 @@ POST /api/v1/payment {order_ref, gateway_status, transaction_id, ...}
    │
    ├─ status = success
    │    → validate server-side → INSERT orders + order_items (update orders table)
-   │    → payment_status='success', store transaction_id, recompute total = sum of lines
+   │    → payment_status='success', kitchen_status='in_queue', order_status='ordered', store transaction_id, recompute total = sum of lines
    │    → generate bill message + send SMS to phone_number
    │    → broadcast new order to kitchen WS (FIFO)
    │    → respond {status: 'success', order_number, total}
@@ -282,7 +284,9 @@ cart → gateway sandbox redirect/checkout (customer pays)
 ## 8. Real-time Streaming (FastAPI WebSocket)
 
 1. **`/api/v1/ws/menu`** — staff add/remove/availability changes are broadcast to every connected menu viewer (including the staff's own menu). Customers see updates without refresh ("no defects"). Availability & add/remove are pushed instantly.
-2. **`/api/v1/ws/orders`** — when a payment succeeds and the order is persisted (Section 7), the backend broadcasts the new order to all connected kitchen boards. Kitchen renders **FIFO** (oldest first).
+2. **`/api/v1/ws/orders`** — broadcasts to all connected kitchen boards:
+   - a newly placed order (payment succeeded + order persisted, Section 7, rendered **FIFO** oldest first)
+   - `kitchen_status` / `order_status` updates from any staff `PATCH /orders/{order_uuid}` so open boards stay in sync.
 
 Design: WebSocket connection per page; small manager in FastAPI (`ConnectionManager`) with `connect/disconnect/broadcast`. Menu WS is public; orders WS authenticates the token on connect with role check.
 
