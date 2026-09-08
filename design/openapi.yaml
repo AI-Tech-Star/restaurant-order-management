@@ -1,0 +1,1741 @@
+openapi: 3.0.0
+info:
+  title: Soroco House — Restaurant Order Management API
+  version: 1.0.0
+  description: |
+    Backend API for the Soroco House QR-menu ordering system.
+
+    Handles:
+    - Customer flows: menu browsing, sandbox payment (PhonePe / Razorpay),
+      order placement + bill SMS.
+    - Staff flows: login/signup (JWT with role), kitchen order board (FIFO).
+    - Admin flows: employee management, order history + CSV export.
+
+    Conventions:
+    - Every response uses the standard envelope: status, code, message, data,
+      errors[], timestamp, request_id.
+    - Success -> status "success", errors = []; failure -> status "error",
+      errors[] with {field, code, message} and data = null.
+    - All routes are under the /api/v1 prefix (this server URL). The frontend
+      never writes /api/v1 in code; its VITE_API_BASE_URL already carries it.
+    - Protected routes use `Authorization: Bearer <JWT>`.
+    - Kitchen order status (In-Queue/Preparing/Prepared), order lifecycle
+      (Ordered/Delivered) and menu availability are PERSISTED server-side and
+      updated via PATCH /menu/{menu_uuid} and PATCH /orders/{order_uuid}.
+      Real-time menu and order events stream over WebSockets (documented in
+      design/api-docs.md): ws /api/v1/ws/menu (public) and
+      ws /api/v1/ws/orders (bearer token).
+  contact:
+    name: Soroco House Dev Team
+
+servers:
+  - url: "http://localhost:8000/api/v1"
+
+tags:
+  - name: Health
+  - name: Menu
+  - name: Payment
+  - name: Orders
+  - name: Auth
+  - name: Admin
+
+paths:
+  # ─── Health ───
+  /health:
+    get:
+      summary: Health check
+      description: |
+        Liveness probe. Returns 200 if the API is running. Intentionally
+        unauthenticated for load balancer / health probes.
+      operationId: healthCheck
+      tags:
+        - Health
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                healthy:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Service is healthy"
+                    data:
+                      checks:
+                        server: "ok"
+                    errors: []
+                    timestamp: "2026-09-07T10:30:45.123Z"
+                    request_id: "req-7f3a9b2c-4d1e-4a8f-9c5b-6e2d8f1a3b4c"
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  # ─── Menu ───
+  /menu:
+    get:
+      summary: List menu grouped by category
+      description: |
+        Public endpoint. Returns the full menu grouped by category for the
+        customer /menu page. Unavailable items (is_available=false) are still
+        returned and are greyed out client-side for customers; staff see them
+        so they can re-enable.
+      operationId: listMenu
+      tags:
+        - Menu
+      security: []
+      responses:
+        '200':
+          description: Menu retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                success:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Menu retrieved successfully"
+                    data:
+                      categories:
+                        - category: "Hot Luxury Teas"
+                          items:
+                            - menu_uuid: "m1111111-1111-1111-1111-111111111111"
+                              menu_id: 101
+                              item_name: "Lavender Earl Grey"
+                              item_description: "Clean, Floral"
+                              image_url: null
+                              is_available: true
+                              prices:
+                                standard_price: 140.00
+                                small_price: null
+                                large_price: null
+                        - category: "Cold Brew"
+                          items:
+                            - menu_uuid: "m2222222-2222-2222-2222-222222222222"
+                              menu_id: 102
+                              item_name: "Classic Cold Brew"
+                              item_description: null
+                              image_url: null
+                              is_available: true
+                              prices:
+                                standard_price: null
+                                small_price: 140.00
+                                large_price: 180.00
+                    errors: []
+                    timestamp: "2026-09-07T10:30:45.123Z"
+                    request_id: "req-2f6b8c4a-1e2d-4b7a-9c3e-8f1a5b2c7d4e"
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+    post:
+      summary: Add a new menu item
+      description: |
+        Staff only (employee or admin). Validates the JWT on the backend and
+        inserts a new menu item. A menu item must have at least one price set.
+        The new item is broadcast to connected menu viewers over WebSocket.
+      operationId: addMenuItem
+      tags:
+        - Menu
+      security:
+        - bearer_auth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddMenuItemRequest'
+            examples:
+              standard_only:
+                summary: Item sold only in standard size
+                value:
+                  item_name: "Lavender Earl Grey"
+                  category: "Hot Luxury Teas"
+                  item_description: "Clean, Floral"
+                  standard_price: 140.00
+                  small_price: null
+                  large_price: null
+              sizes:
+                summary: Item with small and large sizes
+                value:
+                  item_name: "Classic Cold Brew"
+                  category: "Cold Brew"
+                  item_description: null
+                  standard_price: null
+                  small_price: 140.00
+                  large_price: 180.00
+      responses:
+        '201':
+          description: Menu item created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                created:
+                  value:
+                    status: "success"
+                    code: 201
+                    message: "Menu item created successfully"
+                    data:
+                      menu_uuid: "m3333333-3333-3333-3333-333333333333"
+                      menu_id: 104
+                      item_name: "Lavender Earl Grey"
+                      category: "Hot Luxury Teas"
+                      item_description: "Clean, Floral"
+                      image_url: null
+                      is_available: true
+                      prices:
+                        standard_price: 140.00
+                        small_price: null
+                        large_price: null
+                    errors: []
+                    timestamp: "2026-09-07T10:31:10.123Z"
+                    request_id: "req-4c8d9e2a-3b6f-4a1c-9d2e-7a1c3b5d8e9f"
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '403':
+          description: Insufficient role
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          $ref: '#/components/responses/validation_error'
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  /menu/{menu_uuid}:
+    patch:
+      summary: Update a menu item (availability, prices, text)
+      description: |
+        Staff only (employee or admin). Validates the JWT on the backend and
+        updates the item. Used mainly for the availability toggle
+        (is_available) but accepts any editable field. The change is broadcast
+        to connected menu viewers over WebSocket.
+      operationId: updateMenuItem
+      tags:
+        - Menu
+      security:
+        - bearer_auth: []
+      parameters:
+        - name: menu_uuid
+          in: path
+          required: true
+          description: Menu item UUID to update.
+          schema:
+            type: string
+            format: uuid
+            example: "m1111111-1111-1111-1111-111111111111"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMenuItemRequest'
+            examples:
+              toggle_unavailable:
+                summary: Mark item unavailable
+                value:
+                  is_available: false
+              edit_prices:
+                summary: Update prices
+                value:
+                  small_price: 150.00
+                  large_price: 190.00
+      responses:
+        '200':
+          description: Menu item updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                updated:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Menu item updated successfully"
+                    data:
+                      menu_uuid: "m1111111-1111-1111-1111-111111111111"
+                      item_name: "Lavender Earl Grey"
+                      category: "Hot Luxury Teas"
+                      item_description: "Clean, Floral"
+                      image_url: null
+                      is_available: false
+                      prices:
+                        standard_price: 140.00
+                        small_price: null
+                        large_price: null
+                    errors: []
+                    timestamp: "2026-09-07T10:33:00.123Z"
+                    request_id: "req-d1e2f3a4-5b6c-4d7e-8f0a-1b2c3d4e5f6a"
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '403':
+          $ref: '#/components/responses/forbidden'
+        '404':
+          description: Menu item not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          $ref: '#/components/responses/validation_error'
+        '500':
+          $ref: '#/components/responses/internal_error'
+    delete:
+      summary: Remove a menu item
+      description: |
+        Staff only (employee or admin). Validates the JWT on the backend and
+        soft-deletes (or removes) the menu item. The removal is broadcast to
+        connected menu viewers over WebSocket.
+      operationId: deleteMenuItem
+      tags:
+        - Menu
+      security:
+        - bearer_auth: []
+      parameters:
+        - name: menu_uuid
+          in: path
+          required: true
+          description: Menu item UUID to remove.
+          schema:
+            type: string
+            format: uuid
+            example: "m1111111-1111-1111-1111-111111111111"
+      responses:
+        '200':
+          description: Menu item deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                deleted:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Menu item deleted successfully"
+                    data: null
+                    errors: []
+                    timestamp: "2026-09-07T10:32:00.123Z"
+                    request_id: "req-9f1a2c3d-4e5b-4f6a-8b7c-2d3e4f5a6b7c"
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '403':
+          $ref: '#/components/responses/forbidden'
+        '404':
+          description: Menu item not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  # ─── Payment ───
+  /payment:
+    post:
+      summary: Payment — init and confirm (one endpoint, two calls)
+      description: |
+        Single public payment endpoint, called twice by the frontend. The backend
+        is the source of truth for pricing.
+
+        CALL 1 (initiate): customer taps Pay. Send payment_method, customer
+        details and cart items. Backend validates the cart, recomputes the total
+        server-side, assigns an order_ref and creates the sandbox session.
+        Response `checkout`:
+        - razorpay -> { provider, key_id, order_id } (client-side Razorpay checkout)
+        - phonepay -> { provider, redirect_url } (redirect to PhonePe sandbox)
+        NO order rows are written yet.
+
+        CALL 2 (confirm): customer returns from the gateway. Send order_ref plus
+        the gateway result. On `success` the order header + items are inserted,
+        the bill SMS is sent, and the order is broadcast to the kitchen board.
+        On `failed` / `cancelled` NO rows are written; a friendly error is
+        returned so the cart stays intact.
+
+        Idempotency: if the same order_ref is confirmed twice, the existing
+        successful order is returned instead of creating a duplicate.
+      operationId: processPayment
+      tags:
+        - Payment
+      security: []
+      requestBody:
+        required: true
+        description: Either the initiate payload or the confirm payload.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/PaymentInitRequest'
+                - $ref: '#/components/schemas/PaymentConfirmRequest'
+            examples:
+              initiate:
+                summary: Call 1 — initiate payment from cart
+                value:
+                  payment_method: "razorpay"
+                  table_name: "A1"
+                  customer_name: "Alex"
+                  phone_number: "+919876543210"
+                  items:
+                    - menu_uuid: "m2222222-2222-2222-2222-222222222222"
+                      selected_size: "large"
+                      quantity: 2
+                    - menu_uuid: "m1111111-1111-1111-1111-111111111111"
+                      selected_size: null
+                      quantity: 1
+              confirm_success:
+                summary: Call 2 — gateway returned success
+                value:
+                  order_ref: "or_abc123def456"
+                  gateway:
+                    status: "success"
+                    transaction_id: "pay_PkF21XS9mup1b9"
+              confirm_cancelled:
+                summary: Call 2 — customer cancelled on the gateway
+                value:
+                  order_ref: "or_abc123def456"
+                  gateway:
+                    status: "cancelled"
+                    transaction_id: null
+      responses:
+        '200':
+          description: |
+            Call 1 -> payment initiated (checkout config + server-computed amount).
+            Call 2 + success -> order placed (order_number + total).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                initiated_razorpay:
+                  summary: Call 1 — Razorpay client checkout
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Payment session created"
+                    data:
+                      order_ref: "or_abc123def456"
+                      amount: 460.00
+                      checkout:
+                        provider: "razorpay"
+                        key_id: "rzp_test_xxxx"
+                        order_id: "order_OacTl8ME3gwMWP"
+                    errors: []
+                    timestamp: "2026-09-07T10:35:00.123Z"
+                    request_id: "req-5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+                initiated_phonepay:
+                  summary: Call 1 — PhonePe sandbox redirect
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Payment session created"
+                    data:
+                      order_ref: "or_abc123def456"
+                      amount: 460.00
+                      checkout:
+                        provider: "phonepay"
+                        redirect_url: "https://mercury-t2.phonepe.com/v3/render/pg?token=abcdef"
+                    errors: []
+                    timestamp: "2026-09-07T10:35:00.123Z"
+                    request_id: "req-5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+                order_placed:
+                  summary: Call 2 — payment succeeded, order placed
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Order placed successfully"
+                    data:
+                      order_number: 12
+                      total_price: 460.00
+                      payment_method: "razorpay"
+                    errors: []
+                    timestamp: "2026-09-07T10:36:12.123Z"
+                    request_id: "req-6b7c8d9e-0a1f-4b2c-9d3e-4f5a6b7c8d9e"
+        '400':
+          description: Payment failed or cancelled by the customer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                cancelled:
+                  summary: Customer cancelled on the gateway
+                  value:
+                    status: "error"
+                    code: 400
+                    message: "Payment cancelled"
+                    data: null
+                    errors:
+                      - field: "gateway.status"
+                        code: "PAYMENT_CANCELLED"
+                        message: "Payment was cancelled. No amount was charged. Please try again."
+                    timestamp: "2026-09-07T10:36:20.123Z"
+                    request_id: "req-7c8d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e0f"
+                failed:
+                  summary: Gateway reported failure
+                  value:
+                    status: "error"
+                    code: 400
+                    message: "Payment failed"
+                    data: null
+                    errors:
+                      - field: "gateway.status"
+                        code: "PAYMENT_FAILED"
+                        message: "Payment failed. No amount was charged. Please try again."
+                    timestamp: "2026-09-07T10:36:21.123Z"
+                    request_id: "req-8d9e0f1a-2b3c-4d4e-9f5a-6b7c8d9e0f1a"
+        '404':
+          description: order_ref unknown
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                order_ref_not_found:
+                  value:
+                    status: "error"
+                    code: 404
+                    message: "Not Found"
+                    data: null
+                    errors:
+                      - field: "order_ref"
+                        code: "ORDER_REF_NOT_FOUND"
+                        message: "No payment session found for this order_ref"
+                    timestamp: "2026-09-07T10:36:22.123Z"
+                    request_id: "req-9e0f1a2b-3c4d-4e5f-8a6b-7c8d9e0f1a2b"
+        '422':
+          $ref: '#/components/responses/validation_error'
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  # ─── Orders (kitchen) ───
+  /orders:
+    get:
+      summary: List kitchen orders in FIFO order
+      description: |
+        Staff only (employee or admin). Returns all placed orders, oldest first
+        (FIFO). Includes kitchen_status and order_status so the kitchen board
+        restores its state after a page refresh. New orders and status changes
+        arrive over WebSocket /api/v1/ws/orders.
+      operationId: listKitchenOrders
+      tags:
+        - Orders
+      security:
+        - bearer_auth: []
+      responses:
+        '200':
+          description: Orders retrieved (FIFO)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                success:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Orders retrieved successfully"
+                    data:
+                      orders:
+                        - order_uuid: "o9999999-9999-9999-9999-999999999999"
+                          order_number: 12
+                          table_name: "A1"
+                          customer_name: "Alex"
+                          phone_number: "+919876543210"
+                          payment_method: "razorpay"
+                          kitchen_status: "in_queue"
+                          order_status: "ordered"
+                          total_price: 460.00
+                          placed_at: "2026-09-07T10:36:12.123Z"
+                          items:
+                            - item_name: "Classic Cold Brew"
+                              selected_size: "large"
+                              quantity: 2
+                              unit_price: 180.00
+                              line_total: 360.00
+                            - item_name: "Lavender Earl Grey"
+                              selected_size: null
+                              quantity: 1
+                              unit_price: 100.00
+                              line_total: 100.00
+                    errors: []
+                    timestamp: "2026-09-07T10:37:00.123Z"
+                    request_id: "req-0a1b2c3d-4e5f-4a6b-9c7d-8e9f0a1b2c3d"
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '403':
+          $ref: '#/components/responses/forbidden'
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  /orders/{order_uuid}:
+    patch:
+      summary: Update order status (kitchen board)
+      description: |
+        Staff only (employee or admin). Updates kitchen_status
+        (in_queue | preparing | prepared) or order_status (delivered).
+        Validation is enum-only: any value from the target column's ENUM is
+        accepted — no enforced transition order. The change is broadcast to all
+        connected kitchen boards over WebSocket.
+      operationId: updateOrderStatus
+      tags:
+        - Orders
+      security:
+        - bearer_auth: []
+      parameters:
+        - name: order_uuid
+          in: path
+          required: true
+          description: Order UUID to update.
+          schema:
+            type: string
+            format: uuid
+            example: "o9999999-9999-9999-9999-999999999999"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrderStatusRequest'
+            examples:
+              preparing:
+                summary: Move an order to Preparing
+                value:
+                  kitchen_status: "preparing"
+              delivered:
+                summary: Mark order delivered
+                value:
+                  order_status: "delivered"
+      responses:
+        '200':
+          description: Order status updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                updated:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Order status updated successfully"
+                    data:
+                      order_uuid: "o9999999-9999-9999-9999-999999999999"
+                      kitchen_status: "preparing"
+                      order_status: "ordered"
+                    errors: []
+                    timestamp: "2026-09-07T10:38:00.123Z"
+                    request_id: "req-1b2c3d4e-5f6a-4b7c-9d8e-0a1b2c3d4e5f"
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '403':
+          $ref: '#/components/responses/forbidden'
+        '404':
+          description: Order not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          $ref: '#/components/responses/validation_error'
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  # ─── Auth ───
+  /auth/login:
+    post:
+      summary: Staff login
+      description: |
+        Validates email + password, then issues a JWT carrying the role stored
+        in the accounts table. Used by /login; the frontend redirects to the
+        originally requested page (/orders or /admin) after success.
+      operationId: login
+      tags:
+        - Auth
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              valid:
+                summary: Staff credentials
+                value:
+                  email: "thameem@restaurant.com"
+                  password: "supersecret123"
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                admin:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Login successful"
+                    data:
+                      token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIx..."
+                      token_type: "bearer"
+                      expires_in: 480
+                      role: "admin"
+                      user:
+                        account_uuid: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                        name: "Thameem"
+                        email: "thameem@restaurant.com"
+                        role: "admin"
+                    errors: []
+                    timestamp: "2026-09-07T10:40:00.123Z"
+                    request_id: "req-1a2b3c4d-5e6f-4a7b-8c9d-0a1b2c3d4e5f"
+        '400':
+          description: Missing fields
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: Account exists but password not set yet (complete signup first)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                signup_pending:
+                  value:
+                    status: "error"
+                    code: 403
+                    message: "Signup pending"
+                    data: null
+                    errors:
+                      - field: "password"
+                        code: "SIGNUP_PENDING"
+                        message: "No password set yet. Please complete signup first."
+                    timestamp: "2026-09-07T10:40:01.123Z"
+                    request_id: "req-2a3b4c5d-6e7f-4a8b-9c0d-1a2b3c4d5e6f"
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                invalid_credentials:
+                  value:
+                    status: "error"
+                    code: 401
+                    message: "Unauthorized"
+                    data: null
+                    errors:
+                      - field: "email"
+                        code: "INVALID_CREDENTIALS"
+                        message: "Invalid email or password"
+                    timestamp: "2026-09-07T10:40:02.123Z"
+                    request_id: "req-3a4b5c6d-7e8f-4a9b-8c0d-1a2b3c4d5e6f"
+        '422':
+          $ref: '#/components/responses/validation_error'
+        '429':
+          description: Too many login attempts — rate limited (5/min per IP)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                rate_limited:
+                  value:
+                    status: "error"
+                    code: 429
+                    message: "Too Many Requests"
+                    data: null
+                    errors:
+                      - field: "email"
+                        code: "RATE_LIMIT_EXCEEDED"
+                        message: "Too many attempts. Please wait a minute and try again."
+                    timestamp: "2026-09-07T10:40:03.123Z"
+                    request_id: "req-4a5b6c7d-8e9f-4a0b-8c1d-2a3b4c5d6e7f"
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  /auth/check-email:
+    post:
+      summary: Check whether an email exists (signup step 1)
+      description: |
+        Public helper for the /signup "Next" step. Accounts are pre-created by an
+        admin (name + email only). This tells the frontend whether the entered
+        email is a valid staff account, so it can reveal the password fields
+        ("invalid email address" error otherwise). The check is re-validated
+        again inside /auth/signup.
+      operationId: checkEmail
+      tags:
+        - Auth
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckEmailRequest'
+            examples:
+              exists:
+                value:
+                  email: "prathick@restaurant.com"
+      responses:
+        '200':
+          description: Email exists — proceed to password
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                email_exists:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Email found. Proceed to set your password."
+                    data:
+                      email_exists: true
+                    errors: []
+                    timestamp: "2026-09-07T10:41:00.123Z"
+                    request_id: "req-4a5b6c7d-8e9f-4a0b-8c1d-2a3b4c5d6e7f"
+        '404':
+          description: Email not found in accounts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                account_not_found:
+                  value:
+                    status: "error"
+                    code: 404
+                    message: "Not Found"
+                    data: null
+                    errors:
+                      - field: "email"
+                        code: "ACCOUNT_NOT_FOUND"
+                        message: "Invalid email address. Ask an admin to add you first."
+                    timestamp: "2026-09-07T10:41:01.123Z"
+                    request_id: "req-5a6b7c8d-9e0f-4a1b-8c2d-3a4b5c6d7e8f"
+        '422':
+          $ref: '#/components/responses/validation_error'
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  /auth/signup:
+    post:
+      summary: Complete staff signup (set password)
+      description: |
+        Public. Staff accounts are pre-created by an admin with name + email and
+        a NULL password. Signup accepts the pre-registered email and sets the
+        password (hashed server-side). Password confirm is validated client-side
+        only and is NOT part of this API. On success a JWT (with the account
+        role) is returned and the frontend redirects to /orders.
+      operationId: signup
+      tags:
+        - Auth
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignupRequest'
+            examples:
+              valid:
+                value:
+                  email: "prathick@restaurant.com"
+                  password: "password@123"
+      responses:
+        '200':
+          description: Account updated with password, JWT issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                signup_success:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Account created successfully"
+                    data:
+                      token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIy..."
+                      token_type: "bearer"
+                      expires_in: 480
+                      role: "employee"
+                      user:
+                        account_uuid: "e5f6g7h8-9012-3456-7890-abcdef123456"
+                        name: "Prathick"
+                        email: "prathick@restaurant.com"
+                        role: "employee"
+                    errors: []
+                    timestamp: "2026-09-07T10:42:00.123Z"
+                    request_id: "req-6a7b8c9d-0e1f-4a2b-9c3d-4a5b6c7d8e9f"
+        '404':
+          description: Email not found in accounts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                account_not_found:
+                  value:
+                    status: "error"
+                    code: 404
+                    message: "Not Found"
+                    data: null
+                    errors:
+                      - field: "email"
+                        code: "ACCOUNT_NOT_FOUND"
+                        message: "Invalid email address. Ask an admin to add you first."
+                    timestamp: "2026-09-07T10:42:01.123Z"
+                    request_id: "req-7a8b9c0d-1e2f-4a3b-9c4d-5a6b7c8d9e0f"
+        '409':
+          description: Password already set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                already_signed_up:
+                  value:
+                    status: "error"
+                    code: 409
+                    message: "Conflict"
+                    data: null
+                    errors:
+                      - field: "email"
+                        code: "ACCOUNT_ALREADY_SIGNED_UP"
+                        message: "This account already has a password. Please log in."
+                    timestamp: "2026-09-07T10:42:02.123Z"
+                    request_id: "req-8a9b0c1d-2e3f-4a4b-9c5d-6a7b8c9d0e1f"
+        '422':
+          $ref: '#/components/responses/validation_error'
+        '429':
+          description: Too many signup attempts — rate limited (5/min per IP)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                rate_limited:
+                  value:
+                    status: "error"
+                    code: 429
+                    message: "Too Many Requests"
+                    data: null
+                    errors:
+                      - field: "email"
+                        code: "RATE_LIMIT_EXCEEDED"
+                        message: "Too many attempts. Please wait a minute and try again."
+                    timestamp: "2026-09-07T10:42:03.123Z"
+                    request_id: "req-9a8b7c6d-5e4f-4a3b-9c2d-1a2b3c4d5e6f"
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  /auth/me:
+    get:
+      summary: Current authenticated user
+      description: |
+        Returns the account details + role for the bearer token. Used by the
+        frontend to decide which staff controls to render.
+      operationId: getCurrentUser
+      tags:
+        - Auth
+      security:
+        - bearer_auth: []
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                success:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Authenticated"
+                    data:
+                      account_uuid: "e5f6g7h8-9012-3456-7890-abcdef123456"
+                      name: "Prathick"
+                      email: "prathick@restaurant.com"
+                      role: "employee"
+                    errors: []
+                    timestamp: "2026-09-07T10:43:00.123Z"
+                    request_id: "req-9a0b1c2d-3e4f-4a5b-9c6d-7a8b9c0d1e2f"
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  # ─── Admin: Employees ───
+  /admin/employees:
+    get:
+      summary: List all employees
+      description: |
+        Admin only. Returns every staff account. has_password tells the admin
+        whether the employee still needs to complete /signup.
+      operationId: listEmployees
+      tags:
+        - Admin
+      security:
+        - bearer_auth: []
+      responses:
+        '200':
+          description: Employees retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                success:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Employees retrieved successfully"
+                    data:
+                      employees:
+                        - account_uuid: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                          name: "Thameem"
+                          email: "thameem@restaurant.com"
+                          role: "admin"
+                          has_password: true
+                          created_at: "2026-03-05T10:00:00.000Z"
+                        - account_uuid: "e5f6g7h8-9012-3456-7890-abcdef123456"
+                          name: "Prathick"
+                          email: "prathick@restaurant.com"
+                          role: "employee"
+                          has_password: false
+                          created_at: "2026-03-05T10:15:00.000Z"
+                    errors: []
+                    timestamp: "2026-09-07T10:44:00.123Z"
+                    request_id: "req-0a1b2c3d-4e5f-4a6b-9c7d-8a9b0c1d2e3f"
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '403':
+          $ref: '#/components/responses/forbidden_admin_only'
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+    post:
+      summary: Create a new employee
+      description: |
+        Admin only. Creates an account with name + email, role employee and
+        password NULL (the employee later sets their password at /signup).
+      operationId: createEmployee
+      tags:
+        - Admin
+      security:
+        - bearer_auth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEmployeeRequest'
+            examples:
+              valid:
+                value:
+                  name: "Prathick"
+                  email: "prathick@restaurant.com"
+      responses:
+        '201':
+          description: Employee created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                created:
+                  value:
+                    status: "success"
+                    code: 201
+                    message: "Employee created successfully"
+                    data:
+                      account_uuid: "e5f6g7h8-9012-3456-7890-abcdef123456"
+                      name: "Prathick"
+                      email: "prathick@restaurant.com"
+                      role: "employee"
+                      has_password: false
+                    errors: []
+                    timestamp: "2026-09-07T10:45:00.123Z"
+                    request_id: "req-1a2b3c4d-5e6f-4a7b-9c8d-9a0b1c2d3e4f"
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '403':
+          $ref: '#/components/responses/forbidden_admin_only'
+        '409':
+          description: Email already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                email_exists:
+                  value:
+                    status: "error"
+                    code: 409
+                    message: "Conflict"
+                    data: null
+                    errors:
+                      - field: "email"
+                        code: "EMAIL_ALREADY_EXISTS"
+                        message: "An account with this email already exists"
+                    timestamp: "2026-09-07T10:45:01.123Z"
+                    request_id: "req-2a3b4c5d-6e7f-4a8b-9c9d-0a1b2c3d4e5f"
+        '422':
+          $ref: '#/components/responses/validation_error'
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  /admin/employees/{account_uuid}:
+    delete:
+      summary: Delete an employee
+      description: |
+        Admin only. Deletes the employee account from the DB. An account with
+        role admin can never be deleted.
+      operationId: deleteEmployee
+      tags:
+        - Admin
+      security:
+        - bearer_auth: []
+      parameters:
+        - name: account_uuid
+          in: path
+          required: true
+          description: Employee account UUID to delete.
+          schema:
+            type: string
+            format: uuid
+            example: "e5f6g7h8-9012-3456-7890-abcdef123456"
+      responses:
+        '200':
+          description: Employee deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                deleted:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Employee deleted successfully"
+                    data: null
+                    errors: []
+                    timestamp: "2026-09-07T10:46:00.123Z"
+                    request_id: "req-3a4b5c6d-7e8f-4a9b-8c0d-1a2b3c4d5e6f"
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '403':
+          $ref: '#/components/responses/forbidden_admin_only'
+        '404':
+          description: Account not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: Admin account cannot be deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                admin_delete_forbidden:
+                  value:
+                    status: "error"
+                    code: 409
+                    message: "Conflict"
+                    data: null
+                    errors:
+                      - field: "account_uuid"
+                        code: "ADMIN_DELETE_FORBIDDEN"
+                        message: "Admin accounts cannot be deleted"
+                    timestamp: "2026-09-07T10:46:01.123Z"
+                    request_id: "req-4a5b6c7d-8e9f-4a0b-9c1d-2a3b4c5d6e7f"
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  # ─── Admin: Order History ───
+  /order-history:
+    get:
+      summary: List orders by date range
+      description: |
+        Admin only. Returns all placed orders within [from, to]. The frontend
+        maps its Today / Yesterday / Custom presets into from/to values.
+        Optionally filter by order_status (ordered | delivered).
+      operationId: getOrderHistory
+      tags:
+        - Admin
+      security:
+        - bearer_auth: []
+      parameters:
+        - name: from
+          in: query
+          required: true
+          description: Range start (ISO date-time).
+          schema:
+            type: string
+            format: date-time
+            example: "2026-09-07T00:00:00Z"
+        - name: to
+          in: query
+          required: true
+          description: Range end (ISO date-time).
+          schema:
+            type: string
+            format: date-time
+            example: "2026-09-07T23:59:59Z"
+        - name: order_status
+          in: query
+          required: false
+          description: Filter by lifecycle status. Omit for all.
+          schema:
+            type: string
+            enum: [ordered, delivered]
+            example: "delivered"
+      responses:
+        '200':
+          description: Orders retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              examples:
+                success:
+                  value:
+                    status: "success"
+                    code: 200
+                    message: "Orders retrieved successfully"
+                    data:
+                      orders:
+                        - order_number: 12
+                          placed_at: "2026-09-07T10:36:12.123Z"
+                          table_name: "A1"
+                          customer_name: "Alex"
+                          phone_number: "+919876543210"
+                          payment_method: "razorpay"
+                          payment_status: "success"
+                          kitchen_status: "in_queue"
+                          order_status: "ordered"
+                          total_price: 460.00
+                          items:
+                            - item_name: "Classic Cold Brew"
+                              selected_size: "large"
+                              quantity: 2
+                              unit_price: 180.00
+                              line_total: 360.00
+                    errors: []
+                    timestamp: "2026-09-07T10:47:00.123Z"
+                    request_id: "req-5a6b7c8d-9e0f-4a1b-9c2d-3a4b5c6d7e8f"
+        '400':
+          description: Invalid or inverted date range
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '403':
+          $ref: '#/components/responses/forbidden_admin_only'
+        '422':
+          $ref: '#/components/responses/validation_error'
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+  /order-history/export.csv:
+    get:
+      summary: Export orders as CSV
+      description: |
+        Admin only. Downloads the filtered orders as a CSV attachment. Same
+        from/to/order_status filters as GET /order-history. Columns:
+        order_number, placed_at, table_name, customer_name, phone_number,
+        items (e.g. "2x Classic Cold Brew (large)"), total_price,
+        payment_method, payment_status, order_status, kitchen_status.
+      operationId: exportOrderHistoryCsv
+      tags:
+        - Admin
+      security:
+        - bearer_auth: []
+      parameters:
+        - name: from
+          in: query
+          required: true
+          description: Range start (ISO date-time).
+          schema:
+            type: string
+            format: date-time
+            example: "2026-09-07T00:00:00Z"
+        - name: to
+          in: query
+          required: true
+          description: Range end (ISO date-time).
+          schema:
+            type: string
+            format: date-time
+            example: "2026-09-07T23:59:59Z"
+        - name: order_status
+          in: query
+          required: false
+          description: Filter by lifecycle status. Omit for all.
+          schema:
+            type: string
+            enum: [ordered, delivered]
+            example: "delivered"
+      responses:
+        '200':
+          description: CSV file download
+          headers:
+            Content-Disposition:
+              description: attachment; filename="order-history-2026-09-07.csv"
+              schema:
+                type: string
+          content:
+            text/csv:
+              schema:
+                type: string
+              examples:
+                csv:
+                  summary: CSV rows
+                  value: |
+                    order_number,placed_at,table_name,customer_name,phone_number,items,total_price,payment_method,payment_status,order_status,kitchen_status
+                    12,2026-09-07T10:36:12.123Z,A1,Alex,+919876543210,"2x Classic Cold Brew (large)",460.00,razorpay,success,ordered,in_queue
+        '401':
+          $ref: '#/components/responses/unauthorized'
+        '403':
+          $ref: '#/components/responses/forbidden_admin_only'
+        '422':
+          $ref: '#/components/responses/validation_error'
+        '500':
+          $ref: '#/components/responses/internal_error'
+
+components:
+  securitySchemes:
+    bearer_auth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT token issued by POST /auth/login or POST /auth/signup.
+
+  schemas:
+    SuccessEnvelope:
+      type: object
+      description: Standard success envelope for every endpoint.
+      required:
+        - status
+        - code
+        - message
+        - data
+        - errors
+        - timestamp
+        - request_id
+      properties:
+        status:
+          type: string
+          enum: [success]
+          example: "success"
+        code:
+          type: integer
+          example: 200
+        message:
+          type: string
+          example: "Success"
+        data:
+          type: object
+          nullable: true
+        errors:
+          type: array
+          items:
+            type: object
+          example: []
+        timestamp:
+          type: string
+          format: date-time
+        request_id:
+          type: string
+          format: uuid
+
+    ErrorEnvelope:
+      type: object
+      description: Standard error envelope for every failed call.
+      required:
+        - status
+        - code
+        - message
+        - data
+        - errors
+        - timestamp
+        - request_id
+      properties:
+        status:
+          type: string
+          enum: [error]
+          example: "error"
+        code:
+          type: integer
+          example: 400
+        message:
+          type: string
+          example: "Bad Request"
+        data:
+          type: object
+          nullable: true
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorItem'
+        timestamp:
+          type: string
+          format: date-time
+        request_id:
+          type: string
+          format: uuid
+
+    ErrorItem:
+      type: object
+      required:
+        - field
+        - code
+        - message
+      properties:
+        field:
+          type: string
+          description: Request field (or context) that failed.
+          example: "email"
+        code:
+          type: string
+          example: "VALIDATION_ERROR"
+        message:
+          type: string
+          description: Human-readable, user-friendly message.
+          example: "email must be a valid email address"
+
+    AddMenuItemRequest:
+      type: object
+      description: At least one of the three prices is required.
+      required:
+        - item_name
+        - category
+      properties:
+        item_name:
+          type: string
+          maxLength: 255
+          example: "Lavender Earl Grey"
+        category:
+          type: string
+          maxLength: 100
+          example: "Hot Luxury Teas"
+        item_description:
+          type: string
+          nullable: true
+          example: "Clean, Floral"
+        standard_price:
+          type: number
+          format: double
+          nullable: true
+          example: 140.00
+        small_price:
+          type: number
+          format: double
+          nullable: true
+          example: 140.00
+        large_price:
+          type: number
+          format: double
+          nullable: true
+          example: 180.00
+
+    UpdateMenuItemRequest:
+      type: object
+      description: Any supplied field is updated. is_available drives the availability toggle (persisted).
+      properties:
+        item_name:
+          type: string
+          maxLength: 255
+          example: "Lavender Earl Grey"
+        category:
+          type: string
+          maxLength: 100
+          example: "Hot Luxury Teas"
+        item_description:
+          type: string
+          nullable: true
+          example: "Clean, Floral"
+        standard_price:
+          type: number
+          format: double
+          nullable: true
+          example: 140.00
+        small_price:
+          type: number
+          format: double
+          nullable: true
+          example: 150.00
+        large_price:
+          type: number
+          format: double
+          nullable: true
+          example: 190.00
+        is_available:
+          type: boolean
+          description: false greys the item out for customers.
+          example: false
+
+    UpdateOrderStatusRequest:
+      type: object
+      description: Supply either kitchen_status or order_status (or both). Enum-only validation — any ENUM value is accepted, no enforced transition order.
+      properties:
+        kitchen_status:
+          type: string
+          enum: [in_queue, preparing, prepared]
+          example: "preparing"
+        order_status:
+          type: string
+          enum: [ordered, delivered]
+          example: "delivered"
+
+    PaymentInitRequest:
+      type: object
+      description: Call 1 payload — initiate a payment from the cart.
+      required:
+        - payment_method
+        - table_name
+        - customer_name
+        - phone_number
+        - items
+      properties:
+        payment_method:
+          type: string
+          enum: [phonepay, razorpay]
+          example: "razorpay"
+        table_name:
+          type: string
+          maxLength: 255
+          example: "A1"
+        customer_name:
+          type: string
+          maxLength: 255
+          example: "Alex"
+        phone_number:
+          type: string
+          description: Customer phone where the bill SMS is sent.
+          example: "+919876543210"
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required:
+              - menu_uuid
+              - quantity
+            properties:
+              menu_uuid:
+                type: string
+                format: uuid
+                example: "m2222222-2222-2222-2222-222222222222"
+              selected_size:
+                type: string
+                enum: [standard, small, large]
+                nullable: true
+                example: "large"
+              quantity:
+                type: integer
+                minimum: 1
+                example: 2
+
+    PaymentConfirmRequest:
+      type: object
+      description: Call 2 payload — report the gateway result.
+      required:
+        - order_ref
+        - gateway
+      properties:
+        order_ref:
+          type: string
+          description: Reference returned by Call 1.
+          example: "or_abc123def456"
+        gateway:
+          type: object
+          required:
+            - status
+          properties:
+            status:
+              type: string
+              enum: [success, failed, cancelled]
+              example: "success"
+            transaction_id:
+              type: string
+              nullable: true
+              description: Gateway transaction/payment id (null when cancelled).
+              example: "pay_PkF21XS9mup1b9"
+
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: "thameem@restaurant.com"
+        password:
+          type: string
+          format: password
+          minLength: 8
+          example: "supersecret123"
+
+    CheckEmailRequest:
+      type: object
+      required:
+        - email
+      properties:
+        email:
+          type: string
+          format: email
+          example: "prathick@restaurant.com"
+
+    SignupRequest:
+      type: object
+      description: Confirm password is validated on the client and NOT sent here.
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: "prathick@restaurant.com"
+        password:
+          type: string
+          format: password
+          minLength: 8
+          example: "password@123"
+
+    CreateEmployeeRequest:
+      type: object
+      required:
+        - name
+        - email
+      properties:
+        name:
+          type: string
+          maxLength: 255
+          example: "Prathick"
+        email:
+          type: string
+          format: email
+          example: "prathick@restaurant.com"
+
+  responses:
+    unauthorized:
+      description: Unauthorized — missing, invalid or expired token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            unauthorized:
+              value:
+                status: "error"
+                code: 401
+                message: "Unauthorized"
+                data: null
+                errors:
+                  - field: "Authorization"
+                    code: "UNAUTHORIZED"
+                    message: "Invalid or expired authentication token"
+                timestamp: "2026-09-07T10:50:00.123Z"
+                request_id: "req-aaaaaaaa-0000-0000-0000-000000000001"
+
+    forbidden:
+      description: Forbidden — role insufficient for this action
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            forbidden:
+              value:
+                status: "error"
+                code: 403
+                message: "Forbidden"
+                data: null
+                errors:
+                  - field: "role"
+                    code: "FORBIDDEN"
+                    message: "You do not have permission to perform this action"
+                timestamp: "2026-09-07T10:50:00.123Z"
+                request_id: "req-aaaaaaaa-0000-0000-0000-000000000002"
+
+    forbidden_admin_only:
+      description: Forbidden — admin role required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            admin_only:
+              value:
+                status: "error"
+                code: 403
+                message: "Forbidden"
+                data: null
+                errors:
+                  - field: "role"
+                    code: "ADMIN_ROLE_REQUIRED"
+                    message: "Only admin role can access this resource"
+                timestamp: "2026-09-07T10:50:00.123Z"
+                request_id: "req-aaaaaaaa-0000-0000-0000-000000000003"
+
+    validation_error:
+      description: Validation Error — request body or parameters invalid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            invalid_field:
+              value:
+                status: "error"
+                code: 422
+                message: "Validation Error"
+                data: null
+                errors:
+                  - field: "quantity"
+                    code: "VALIDATION_ERROR"
+                    message: "quantity must be an integer greater than 0"
+                timestamp: "2026-09-07T10:50:00.123Z"
+                request_id: "req-aaaaaaaa-0000-0000-0000-000000000004"
+
+    internal_error:
+      description: Internal error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          examples:
+            server_error:
+              value:
+                status: "error"
+                code: 500
+                message: "Internal Error"
+                data: null
+                errors:
+                  - field: "server"
+                    code: "INTERNAL_ERROR"
+                    message: "An unexpected error occurred"
+                timestamp: "2026-09-07T10:50:00.123Z"
+                request_id: "req-aaaaaaaa-0000-0000-0000-000000000005"
